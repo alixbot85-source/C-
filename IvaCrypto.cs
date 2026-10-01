@@ -154,6 +154,7 @@ public sealed class IvaCrypto
     /// </summary>
     public static RSA ImportPublicKey(string key)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
         var rsa = RSA.Create();
         var trimmed = key.Trim();
 
@@ -184,6 +185,7 @@ public sealed class IvaCrypto
 
     private static RsaKeyParameters ToBouncyPublicKey(string key)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
         var trimmed = key.Trim();
 
         if (trimmed.Contains("BEGIN", StringComparison.Ordinal))
@@ -227,10 +229,11 @@ public sealed class IvaCrypto
     /// </summary>
     public static string Base64ModulusToPem(string base64Modulus)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(base64Modulus);
         const string spkiPrefix =
             "30820122300D06092A864886F70D01010105000382010F003082010A0282010100";
         const string spkiSuffix = "0203010001";
-        var der = spkiPrefix + Base64ToHex(base64Modulus) + spkiSuffix;
+        var der = spkiPrefix + Base64ToHex(StripBase64(base64Modulus)) + spkiSuffix;
         var b64 = HexToBase64(der);
         var lines = string.Join("\n",
             Enumerable.Range(0, (b64.Length + 63) / 64)

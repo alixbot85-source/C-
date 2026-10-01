@@ -1,0 +1,10 @@
+# ==============================================================================
+# Requirements for IVA Telegram Bot (Termux / Android & Linux)
+# ==============================================================================
+# The core bot engine is self-contained and uses standard Python 3.10+ libraries
+# and native OpenSSL (libcrypto) available via `pkg install openssl python`.
+#
+# Optional high-performance packages (installed automatically in virtualenv):
+# ==============================================================================
+urllib3>=2.0.0
+certifi>=2024.2.2

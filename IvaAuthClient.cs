@@ -732,14 +732,14 @@ public sealed class IvaAuthClient : IDisposable
         return await SendOnceAsync(requestFactory(), ct).ConfigureAwait(false);
     }
 
-    private Task<HttpResponseMessage> SendOnceAsync(HttpRequestMessage req, CancellationToken ct)
+    private async Task<HttpResponseMessage> SendOnceAsync(HttpRequestMessage req, CancellationToken ct)
     {
         string body = string.Empty;
         if (req.Content is not null)
-            body = req.Content.ReadAsStringAsync(ct).GetAwaiter().GetResult();
+            body = await req.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
         ApplyHeaders(req, req.RequestUri?.AbsolutePath ?? string.Empty, body);
-        return _http.SendAsync(req, ct);
+        return await _http.SendAsync(req, ct).ConfigureAwait(false);
     }
 
     /// <summary>POST and return the envelope's data section.</summary>
@@ -828,10 +828,30 @@ public sealed class IvaAuthClient : IDisposable
 
         var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         Log("GET", url, (int)res.StatusCode, text);
-        using var doc = JsonDocument.Parse(text);
-        var root = doc.RootElement;
-        ThrowIfErrorEnvelope(root, res.StatusCode);
-        return root.TryGetProperty("data", out var data) ? data.Clone() : root.Clone();
+
+        if (!res.IsSuccessStatusCode && string.IsNullOrWhiteSpace(text))
+            throw new IvaApiException($"GET {path} failed (HTTP {(int)res.StatusCode}).", ((int)res.StatusCode).ToString());
+
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(text);
+        }
+        catch (JsonException)
+        {
+            throw new IvaApiException($"GET {path} returned invalid response (HTTP {(int)res.StatusCode}): {text}", ((int)res.StatusCode).ToString());
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+            ThrowIfErrorEnvelope(root, res.StatusCode);
+
+            if (!res.IsSuccessStatusCode)
+                throw new IvaApiException($"GET {path} failed (HTTP {(int)res.StatusCode}).", ((int)res.StatusCode).ToString());
+
+            return root.TryGetProperty("data", out var data) ? data.Clone() : root.Clone();
+        }
     }
 
     private static void ThrowIfErrorEnvelope(JsonElement root, HttpStatusCode status)
