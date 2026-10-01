@@ -715,11 +715,46 @@ class FileSessionRepository:
 # ------------------------------------------------------------------------------
 
 class AsyncHttpClient:
-    """Async HTTP executor using standard library asyncio + urllib with SSL."""
+    """Async HTTP executor using standard library asyncio + urllib with Sadad/Iranian TLS support."""
 
     def __init__(self, timeout: float = 65.0):
         self.timeout = timeout
-        self.ssl_context = ssl.create_default_context()
+        self.ssl_context = self._build_tls_context()
+
+    @staticmethod
+    def _build_tls_context() -> ssl.SSLContext:
+        """Constructs an SSLContext compatible with domestic Iranian payment servers."""
+        try:
+            ctx = ssl.create_default_context()
+        except Exception:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        # Legacy renegotiation flags for banking gateways
+        if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+            ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+        else:
+            ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+
+        if hasattr(ssl, "OP_DONT_INSERT_EMPTY_FRAGMENTS"):
+            ctx.options |= ssl.OP_DONT_INSERT_EMPTY_FRAGMENTS
+
+        # Ciphers compatibility (SECLEVEL=1 allows SHA-1 and 1024/2048-bit RSA domestic certs)
+        for cipher_suite in [
+            "DEFAULT:@SECLEVEL=1:ALL:!aNULL:!eNULL",
+            "HIGH:MEDIUM:@SECLEVEL=1:!aNULL:!eNULL",
+            "ALL:@SECLEVEL=1",
+            "DEFAULT:@SECLEVEL=0",
+        ]:
+            try:
+                ctx.set_ciphers(cipher_suite)
+                break
+            except Exception:
+                pass
+
+        # Relax verification for domestic gateways
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
     async def request(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]) -> Tuple[int, str]:
         loop = asyncio.get_running_loop()
@@ -739,16 +774,38 @@ class AsyncHttpClient:
             return status, resp_text
         except Exception as ex:
             err_msg = str(ex)
+
+            # Secondary fallback for TLS Handshake alerts
+            if "SSL" in err_msg or "HANDSHAKE" in err_msg:
+                try:
+                    alt_ctx = ssl._create_unverified_context()
+                    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+                        alt_ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+                    else:
+                        alt_ctx.options |= 0x4
+                    alt_ctx.check_hostname = False
+                    alt_ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, timeout=self.timeout, context=alt_ctx) as resp:
+                        return resp.getcode(), resp.read().decode("utf-8")
+                except urllib.error.HTTPError as hex_err:
+                    return hex_err.code, hex_err.read().decode("utf-8", errors="replace")
+                except Exception as ex2:
+                    err_msg = str(ex2)
+
             if "timed out" in err_msg or "Timeout" in err_msg:
-                raise IvaApiException("مهلت اتصال به سرور ایوا به پایان رسید (Connection Timeout). لطفاً اینترنت خود را بررسی کنید.")
+                raise IvaApiException("مهلت اتصال به سرور ایوا به پایان رسید (Connection Timeout).")
             elif "Name or service not known" in err_msg or "getaddrinfo failed" in err_msg:
-                raise IvaApiException("عدم دسترسی به سرور ایوا (DNS Error). در صورت فعال بودن فیلترشکن، ممکن است سرورهای ایرانی محدود شده باشند.")
+                raise IvaApiException("عدم دسترسی به سرور ایوا (DNS/Host Error). در صورت فعال بودن VPN، آن را بررسی فرمایید.")
             elif "Connection refused" in err_msg:
                 raise IvaApiException("اتصال به سرور ایوا برقرار نشد (Connection Refused).")
-            elif "SSL" in err_msg or "CERTIFICATE" in err_msg:
-                raise IvaApiException(f"خطای امنیتی گواهی SSL: {err_msg}")
+            elif "SSL" in err_msg or "CERTIFICATE" in err_msg or "HANDSHAKE" in err_msg:
+                raise IvaApiException(
+                    f"خطای امنیتی گواهی SSL سرور ایوا:\n{err_msg}\n\n"
+                    "💡 راهنما: سرورهای پرداخت سداد/ایوا در شبکه ملی اینترنت قرار دارند. "
+                    "در صورت فعال بودن فیلترشکن، ممکن است اتصال مستقیم TLS مسدود گردد."
+                )
             else:
-                raise IvaApiException(f"خطای شبکه: {err_msg}")
+                raise IvaApiException(f"خطای ارتباط شبکه: {err_msg}")
 
 
 class IvaAuthClient:
@@ -1074,7 +1131,6 @@ class TelegramBot:
         res = await self.call_api("sendMessage", payload)
         if not res.get("ok"):
             err_desc = res.get("description", "")
-            # If HTML parsing fails on Telegram side, retry automatically as plain text
             if "can't parse entities" in err_desc or "entity" in err_desc.lower():
                 log_debug(f"Retrying sendMessage without parse_mode due to entity issue: {err_desc}")
                 payload.pop("parse_mode", None)
