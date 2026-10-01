@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import ssl
 import sys
 import time
@@ -1169,10 +1170,11 @@ async def run_terminal_cli() -> None:
         print("5. 📱 دریافت اطلاعات پایه و کاتالوگ شارژ")
         print("6. 📋 مشاهده و تعویض حساب‌های ذخیره‌شده")
         print("7. 🤖 اجرای ربات تلگرام (Telegram Bot Polling)")
+        print("8. 🗑 حذف تمامی سشن‌ها و پاکسازی دیتابیس محلی")
         print("0. ❌ خروج")
         print("-" * 55)
 
-        choice = await loop.run_in_executor(None, ask, "👉 شماره گزینه را وارد فرمایید [0-7]: ")
+        choice = await loop.run_in_executor(None, ask, "👉 شماره گزینه را وارد فرمایید [0-8]: ")
 
         if choice == "0":
             print("\n👋 خروج از سامانه ترمینال.")
@@ -1278,6 +1280,25 @@ async def run_terminal_cli() -> None:
             print("🤖 در حال اجرای ربات تلگرام...")
             bot = TelegramBot(token)
             await bot.start_polling()
+
+        elif choice == "8":
+            confirm = await loop.run_in_executor(None, ask, "⚠️ آیا از حذف تمامی سشن‌ها و فایل‌های لاگین اطمینان دارید؟ [y/n]: ")
+            if confirm.lower() in ("y", "yes", "بله", "1"):
+                if os.path.exists(Config.SESSION_DIR):
+                    for item in os.listdir(Config.SESSION_DIR):
+                        item_path = os.path.join(Config.SESSION_DIR, item)
+                        if os.path.isdir(item_path):
+                            shutil.rmtree(item_path, ignore_errors=True)
+                        else:
+                            try:
+                                os.remove(item_path)
+                            except Exception:
+                                pass
+                client.session = SessionData()
+                client.current_phone = None
+                user_active_phone.clear()
+                user_states.clear()
+                print("🗑 تمامی سشن‌ها با موفقیت به طور کامل حذف شدند.")
 
 
 # ------------------------------------------------------------------------------
@@ -1423,6 +1444,20 @@ class TelegramBot:
             await self.send_message(chat_id, welcome, self.get_main_menu(is_connected, phone, user_id))
             return
 
+        if text in ("/logout", "/clearsessions"):
+            phones = await self.repo.list_phones(user_id)
+            for p in phones:
+                await self.repo.delete(user_id, p)
+            # Also clear terminal user 1001 if admin
+            if self.is_admin(user_id):
+                t_phones = await self.repo.list_phones(1001)
+                for tp in t_phones:
+                    await self.repo.delete(1001, tp)
+            user_active_phone.pop(user_id, None)
+            user_states.pop(user_id, None)
+            await self.send_message(chat_id, "🗑 تمامی سشن‌ها و حساب‌های شما با موفقیت به طور کامل حذف گردیدند.")
+            return
+
         if text == "/help":
             help_text = (
                 "📖 <b>راهنمای ربات تلگرام IVA / Sadad</b>\n\n"
@@ -1434,7 +1469,8 @@ class TelegramBot:
                 "• <b>💳 خرید شارژ:</b> خرید شارژ پین با رمزنگاری امن کارت بانکی.\n"
                 "• <b>📋 مدیریت حساب‌ها:</b> افزودن چند شماره و سوئیچ بین حساب‌ها.\n"
                 "• <b>📊 وضعیت:</b> بررسی مدت زمان اعتبار توکن و آماده‌بودن کلیدها.\n"
-                "• <b>🧪 تست API:</b> تست سلامت تک‌تک اندپوینت‌ها."
+                "• <b>🧪 تست API:</b> تست سلامت تک‌تک اندپوینت‌ها.\n"
+                "• <b>🗑 خروج کامل:</b> ارسال دستور <code>/logout</code> جهت حذف تمام سشن‌ها."
             )
             await self.send_message(chat_id, help_text)
             return
