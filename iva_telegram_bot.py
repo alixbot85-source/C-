@@ -1,62 +1,52 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ================================================================================
-IVA / Sadad Authentication & Payment Telegram Bot Wrapper (Python 3.10+)
-Ready for Android Termux & Linux Servers
+IVA / Sadad Android & Linux Unified Telegram Bot & API Client
 ================================================================================
-Complete, production-ready async Python implementation mirroring C# Iva.Auth.
-
-Features:
-  - 8 Active IVA Endpoints (verifyCode, token, refreshtoken, keyExchange,
-    users/me, configs/list, pin/mobile/catalog, pin/payment).
-  - Complete Authentication Flow (OTP -> Token -> KeyExchange -> Secure Channel).
-  - Native Cryptographic Engine (AES-256-CBC, Zero/Custom IV, HMAC-SHA256, RSA PKCS#1 v1.5).
-  - Multi-Account & Multi-User Session Isolation (Atomic file persistence).
-  - Automatic 401 Token Refresh with Single-Retry Protection.
-  - Dedicated Admin Panel (restricted to TELEGRAM_ADMIN_ID).
-  - Masked Logging (saved to logs/iva_bot.log and memory).
-  - Standalone & self-contained (works out-of-the-box in Termux).
-
-Environment Variables:
-  - TELEGRAM_BOT_TOKEN : Telegram Bot API Token from @BotFather (Required)
-  - TELEGRAM_ADMIN_ID  : Telegram Numeric User ID for Admin privileges (Optional)
-  - IVA_BASE_URL       : Base API URL (Default: https://ivaapi.sadadpsp.ir)
-  - IVA_API_PREFIX     : Base API Prefix (Default: /pwa/api)
-  - IVA_SESSION_DIR    : Directory for storing user sessions (Default: ./sessions)
-  - IVA_APP_VERSION    : Application Version (Default: 3.10.24)
+Compatible with:
+  - Android Termux (aarch64 / arm64 / armv7l / x86_64)
+  - Python 3.10, 3.11, 3.12, 3.13, 3.14+
+  - Zero mandatory external dependencies (pure standard library + optional cryptography/aiohttp)
 ================================================================================
 """
 
-import os
-import sys
-import json
-import time
-import hmac
-import base64
-import hashlib
-import logging
+from __future__ import annotations
+
 import asyncio
-import secrets
-import urllib.request
-import urllib.error
-import urllib.parse
-import ssl
-from typing import Optional, Any, Dict, List, Tuple, Set
-from dataclasses import dataclass, asdict
+import base64
 import ctypes
 import ctypes.util
+from dataclasses import dataclass, asdict
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import ssl
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Try importing optional acceleration libraries
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding as crypto_padding
+    _HAS_CRYPTOGRAPHY = True
+except Exception:
+    _HAS_CRYPTOGRAPHY = False
+
 
 # ------------------------------------------------------------------------------
-# 1. Configuration & Masked Logging
+# 1. Configuration & Logging Subsystem
 # ------------------------------------------------------------------------------
 
 class Config:
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    TELEGRAM_ADMIN_ID: Optional[int] = (
-        int(os.getenv("TELEGRAM_ADMIN_ID").strip())
-        if os.getenv("TELEGRAM_ADMIN_ID") and os.getenv("TELEGRAM_ADMIN_ID").strip().isdigit()
-        else None
-    )
     API_BASE_URL: str = os.getenv("IVA_BASE_URL", "https://ivaapi.sadadpsp.ir").rstrip("/")
     API_PREFIX: str = os.getenv("IVA_API_PREFIX", "/pwa/api")
     APP_VERSION: str = os.getenv("IVA_APP_VERSION", "3.10.24")
@@ -66,6 +56,15 @@ class Config:
     BOT_START_TIME: float = time.time()
 
     @classmethod
+    def get_bot_token(cls) -> str:
+        return os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+    @classmethod
+    def get_admin_id(cls) -> Optional[int]:
+        val = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+        return int(val) if val.isdigit() else None
+
+    @classmethod
     def get_base_address(cls) -> str:
         return cls.API_BASE_URL + cls.API_PREFIX
 
@@ -73,7 +72,6 @@ class Config:
 os.makedirs(Config.SESSION_DIR, exist_ok=True)
 os.makedirs(Config.LOGS_DIR, exist_ok=True)
 
-# Logger setup
 logger = logging.getLogger("IvaBot")
 logger.setLevel(logging.INFO)
 
@@ -93,13 +91,19 @@ logger.addHandler(file_handler)
 in_memory_logs: List[str] = []
 known_users: Set[int] = set()
 
+
 def mask_sensitive(text: str) -> str:
-    """Masks tokens, OTPs, PINs, CVV2, and sensitive keys from output."""
+    """Masks tokens, OTPs, PINs, CVV2, and PANs from output logs."""
     if not text:
         return text
-    masked = text
-    # Mask common credential patterns if present
-    return masked
+    s = str(text)
+    # Mask 16-digit card numbers (keep first 6 and last 4)
+    import re
+    s = re.sub(r'\b(\d{6})\d{6}(\d{4})\b', r'\1******\2', s)
+    # Mask Bearer tokens
+    s = re.sub(r'Bearer\s+[A-Za-z0-9_\-\.]{20,}', 'Bearer [MASKED_TOKEN]', s)
+    return s
+
 
 def log_debug(msg: str) -> None:
     logger.debug(msg)
@@ -107,31 +111,200 @@ def log_debug(msg: str) -> None:
     if len(in_memory_logs) > 150:
         in_memory_logs.pop(0)
 
+
 def log_info(msg: str) -> None:
-    logger.info(msg)
+    logger.info(mask_sensitive(msg))
     in_memory_logs.append(f"[{time.strftime('%H:%M:%S')}] INFO: {mask_sensitive(msg)}")
     if len(in_memory_logs) > 150:
         in_memory_logs.pop(0)
 
+
 def log_error(msg: str) -> None:
-    logger.error(msg)
+    logger.error(mask_sensitive(msg))
     in_memory_logs.append(f"[{time.strftime('%H:%M:%S')}] ERROR: {mask_sensitive(msg)}")
     if len(in_memory_logs) > 150:
         in_memory_logs.pop(0)
 
 
 # ------------------------------------------------------------------------------
-# 2. Cryptographic Engine (Port of IvaCrypto.cs)
+# 2. Cryptographic Engine (AES-256-CBC, RSA-2048, HMAC-SHA256)
 # ------------------------------------------------------------------------------
+
+# --- Pure Python AES-256 Tables & Routines ---
+_AES_SBOX = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+]
+_AES_RSBOX = [0] * 256
+for _i, _x in enumerate(_AES_SBOX):
+    _AES_RSBOX[_x] = _i
+
+_AES_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
+
+
+def _xtime(a: int) -> int:
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
+
+
+def _gf_mul(a: int, b: int) -> int:
+    res = 0
+    while b:
+        if b & 1:
+            res ^= a
+        a = _xtime(a)
+        b >>= 1
+    return res
+
+
+def _key_expansion_256(key: bytes) -> List[List[int]]:
+    w = [list(key[i:i+4]) for i in range(0, 32, 4)]
+    for i in range(8, 60):
+        temp = list(w[i-1])
+        if i % 8 == 0:
+            temp = [_AES_SBOX[b] for b in (temp[1:] + temp[:1])]
+            temp[0] ^= _AES_RCON[i // 8]
+        elif i % 8 == 4:
+            temp = [_AES_SBOX[b] for b in temp]
+        w.append([w[i-8][j] ^ temp[j] for j in range(4)])
+    round_keys: List[List[int]] = []
+    for r in range(15):
+        rk: List[int] = []
+        for c in range(4):
+            rk.extend(w[r*4 + c])
+        round_keys.append(rk)
+    return round_keys
+
+
+def _aes_cipher_block(block: bytes, round_keys: List[List[int]]) -> bytes:
+    state = [list(block[i:i+4]) for i in range(0, 16, 4)]
+    for c in range(4):
+        for r in range(4):
+            state[c][r] ^= round_keys[0][c*4 + r]
+    for rnd in range(1, 14):
+        for c in range(4):
+            for r in range(4):
+                state[c][r] = _AES_SBOX[state[c][r]]
+        s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
+        state = [
+            [s0[0], s1[1], s2[2], s3[3]],
+            [s1[0], s2[1], s3[2], s0[3]],
+            [s2[0], s3[1], s0[2], s1[3]],
+            [s3[0], s0[1], s1[2], s2[3]]
+        ]
+        for c in range(4):
+            col = state[c]
+            a, b, cb, d = col[0], col[1], col[2], col[3]
+            state[c][0] = _gf_mul(2, a) ^ _gf_mul(3, b) ^ cb ^ d
+            state[c][1] = a ^ _gf_mul(2, b) ^ _gf_mul(3, cb) ^ d
+            state[c][2] = a ^ b ^ _gf_mul(2, cb) ^ _gf_mul(3, d)
+            state[c][3] = _gf_mul(3, a) ^ b ^ cb ^ _gf_mul(2, d)
+        for c in range(4):
+            for r in range(4):
+                state[c][r] ^= round_keys[rnd][c*4 + r]
+
+    for c in range(4):
+        for r in range(4):
+            state[c][r] = _AES_SBOX[state[c][r]]
+    s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
+    state = [
+        [s0[0], s1[1], s2[2], s3[3]],
+        [s1[0], s2[1], s3[2], s0[3]],
+        [s2[0], s3[1], s0[2], s1[3]],
+        [s3[0], s0[1], s1[2], s2[3]]
+    ]
+    for c in range(4):
+        for r in range(4):
+            state[c][r] ^= round_keys[14][c*4 + r]
+
+    out = bytearray(16)
+    for c in range(4):
+        for r in range(4):
+            out[c*4 + r] = state[c][r]
+    return bytes(out)
+
+
+def _aes_inv_cipher_block(block: bytes, round_keys: List[List[int]]) -> bytes:
+    state = [list(block[i:i+4]) for i in range(0, 16, 4)]
+    for c in range(4):
+        for r in range(4):
+            state[c][r] ^= round_keys[14][c*4 + r]
+    for rnd in range(13, 0, -1):
+        s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
+        state = [
+            [s0[0], s3[1], s2[2], s1[3]],
+            [s1[0], s0[1], s3[2], s2[3]],
+            [s2[0], s1[1], s0[2], s3[3]],
+            [s3[0], s2[1], s1[2], s0[3]]
+        ]
+        for c in range(4):
+            for r in range(4):
+                state[c][r] = _AES_RSBOX[state[c][r]]
+        for c in range(4):
+            for r in range(4):
+                state[c][r] ^= round_keys[rnd][c*4 + r]
+        for c in range(4):
+            col = state[c]
+            a, b, cb, d = col[0], col[1], col[2], col[3]
+            state[c][0] = _gf_mul(0x0e, a) ^ _gf_mul(0x0b, b) ^ _gf_mul(0x0d, cb) ^ _gf_mul(0x09, d)
+            state[c][1] = _gf_mul(0x09, a) ^ _gf_mul(0x0e, b) ^ _gf_mul(0x0b, cb) ^ _gf_mul(0x0d, d)
+            state[c][2] = _gf_mul(0x0d, a) ^ _gf_mul(0x09, b) ^ _gf_mul(0x0e, cb) ^ _gf_mul(0x0b, d)
+            state[c][3] = _gf_mul(0x0b, a) ^ _gf_mul(0x0d, b) ^ _gf_mul(0x09, cb) ^ _gf_mul(0x0e, d)
+
+    s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
+    state = [
+        [s0[0], s3[1], s2[2], s1[3]],
+        [s1[0], s0[1], s3[2], s2[3]],
+        [s2[0], s1[1], s0[2], s3[3]],
+        [s3[0], s2[1], s1[2], s0[3]]
+    ]
+    for c in range(4):
+        for r in range(4):
+            state[c][r] = _AES_RSBOX[state[c][r]]
+    for c in range(4):
+        for r in range(4):
+            state[c][r] ^= round_keys[0][c*4 + r]
+
+    out = bytearray(16)
+    for c in range(4):
+        for r in range(4):
+            out[c*4 + r] = state[c][r]
+    return bytes(out)
+
+
+def _pad_pkcs7(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+
+def _unpad_pkcs7(data: bytes) -> bytes:
+    if not data or len(data) % 16 != 0:
+        raise ValueError("Invalid PKCS7 block length")
+    pad_len = data[-1]
+    if pad_len < 1 or pad_len > 16 or data[-pad_len:] != bytes([pad_len] * pad_len):
+        raise ValueError("Invalid PKCS7 padding bytes")
+    return data[:-pad_len]
+
 
 class IvaCrypto:
     """
-    Cryptographic layer mirroring C# IvaCrypto.cs:
-      - AES-256-CBC, Zero IV / Custom IV, PKCS7 padding, output lowercase hex.
-      - HMAC-SHA256 over request body, keyed with working key, output base64.
-      - RSA-2048 PKCS#1 v1.5 encryption for key exchange, output lowercase hex.
-      - SPKI PEM generation from base64 modulus (exponent 65537).
-      - Pichak RSA-OAEP SHA-256 / MGF1-SHA1.
+    Complete cryptographic layer for IVA / Sadad APIs:
+      - AES-256-CBC with Zero IV / Custom IV and PKCS7 padding
+      - HMAC-SHA256 request signing
+      - RSA PKCS#1 v1.5 encryption for KeyExchange
     """
     CUSTOM_IV = bytes([48, 148, 136, 186, 72, 57, 83, 116, 19, 138, 210, 230, 3, 165, 240, 35])
     ZERO_IV = b"\x00" * 16
@@ -139,10 +312,20 @@ class IvaCrypto:
     _libcrypto: Optional[Any] = None
 
     @classmethod
-    def _get_libcrypto(cls):
+    def _get_libcrypto(cls) -> Optional[Any]:
         if cls._libcrypto is None:
-            lib_name = ctypes.util.find_library("crypto")
-            if lib_name:
+            candidates = [
+                ctypes.util.find_library("crypto"),
+                "/data/data/com.termux/files/usr/lib/libcrypto.so",
+                "/data/data/com.termux/files/usr/lib/libcrypto.so.3",
+                "/usr/lib/libcrypto.so",
+                "libcrypto.so.3",
+                "libcrypto.so.1.1",
+                "libcrypto.so"
+            ]
+            for lib_name in candidates:
+                if not lib_name:
+                    continue
                 try:
                     cls._libcrypto = ctypes.CDLL(lib_name)
                     cls._libcrypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
@@ -150,8 +333,9 @@ class IvaCrypto:
                     cls._libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
                     cls._libcrypto.EVP_EncryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
                     cls._libcrypto.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-                except Exception as ex:
-                    log_debug(f"OpenSSL ctypes init: {ex}")
+                    break
+                except Exception:
+                    cls._libcrypto = None
         return cls._libcrypto
 
     @classmethod
@@ -173,29 +357,71 @@ class IvaCrypto:
     @classmethod
     def _aes_encrypt_iv(cls, plaintext: str, key_base64: str, iv: bytes) -> str:
         key_bytes = base64.b64decode(key_base64)
-        data = plaintext.encode("utf-8")
+        raw_data = plaintext.encode("utf-8")
+
+        # 1. Fast Path: cryptography library if available
+        if _HAS_CRYPTOGRAPHY:
+            try:
+                padder = crypto_padding.PKCS7(128).padder()
+                padded = padder.update(raw_data) + padder.finalize()
+                cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv))
+                enc = cipher.encryptor()
+                ct = enc.update(padded) + enc.finalize()
+                return ct.hex().lower()
+            except Exception as ex:
+                log_debug(f"Cryptography encrypt fallback: {ex}")
+
+        # 2. OpenSSL libcrypto via ctypes
         lib = cls._get_libcrypto()
         if lib:
             ctx = lib.EVP_CIPHER_CTX_new()
             try:
                 cipher = lib.EVP_aes_256_cbc()
                 lib.EVP_EncryptInit_ex(ctx, cipher, None, key_bytes, iv)
-                out = ctypes.create_string_buffer(len(data) + 32)
+                out = ctypes.create_string_buffer(len(raw_data) + 32)
                 out_len = ctypes.c_int(0)
-                lib.EVP_EncryptUpdate(ctx, out, ctypes.byref(out_len), data, len(data))
+                lib.EVP_EncryptUpdate(ctx, out, ctypes.byref(out_len), raw_data, len(raw_data))
                 total_len = out_len.value
                 fin_len = ctypes.c_int(0)
-                lib.EVP_EncryptFinal_ex(ctx, ctypes.byref(out, total_len), ctypes.byref(fin_len))
+                ptr_fin = ctypes.cast(ctypes.addressof(out) + total_len, ctypes.POINTER(ctypes.c_char))
+                lib.EVP_EncryptFinal_ex(ctx, ptr_fin, ctypes.byref(fin_len))
                 total_len += fin_len.value
                 return bytes(out.raw[:total_len]).hex().lower()
+            except Exception as ex:
+                log_debug(f"OpenSSL encrypt fallback: {ex}")
             finally:
                 lib.EVP_CIPHER_CTX_free(ctx)
-        raise RuntimeError("OpenSSL libcrypto library is required for AES-256-CBC.")
+
+        # 3. Pure Python AES-256-CBC Implementation
+        padded_pure = _pad_pkcs7(raw_data)
+        rkeys = _key_expansion_256(key_bytes)
+        ct_pure = bytearray()
+        prev = iv
+        for i in range(0, len(padded_pure), 16):
+            block = bytes(padded_pure[i+j] ^ prev[j] for j in range(16))
+            enc_block = _aes_cipher_block(block, rkeys)
+            ct_pure.extend(enc_block)
+            prev = enc_block
+        return bytes(ct_pure).hex().lower()
 
     @classmethod
     def _aes_decrypt_iv(cls, hex_cipher: str, key_base64: str, iv: bytes) -> str:
         key_bytes = base64.b64decode(key_base64)
         cipher_bytes = bytes.fromhex(hex_cipher)
+
+        # 1. Fast Path: cryptography library if available
+        if _HAS_CRYPTOGRAPHY:
+            try:
+                cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv))
+                dec = cipher.decryptor()
+                padded = dec.update(cipher_bytes) + dec.finalize()
+                unpadder = crypto_padding.PKCS7(128).unpadder()
+                data = unpadder.update(padded) + unpadder.finalize()
+                return data.decode("utf-8")
+            except Exception as ex:
+                log_debug(f"Cryptography decrypt fallback: {ex}")
+
+        # 2. OpenSSL libcrypto via ctypes
         lib = cls._get_libcrypto()
         if lib:
             ctx = lib.EVP_CIPHER_CTX_new()
@@ -207,12 +433,25 @@ class IvaCrypto:
                 lib.EVP_DecryptUpdate(ctx, out, ctypes.byref(out_len), cipher_bytes, len(cipher_bytes))
                 total_len = out_len.value
                 fin_len = ctypes.c_int(0)
-                lib.EVP_DecryptFinal_ex(ctx, ctypes.byref(out, total_len), ctypes.byref(fin_len))
+                ptr_fin = ctypes.cast(ctypes.addressof(out) + total_len, ctypes.POINTER(ctypes.c_char))
+                lib.EVP_DecryptFinal_ex(ctx, ptr_fin, ctypes.byref(fin_len))
                 total_len += fin_len.value
                 return bytes(out.raw[:total_len]).decode("utf-8")
+            except Exception as ex:
+                log_debug(f"OpenSSL decrypt fallback: {ex}")
             finally:
                 lib.EVP_CIPHER_CTX_free(ctx)
-        raise RuntimeError("OpenSSL libcrypto library is required for AES-256-CBC.")
+
+        # 3. Pure Python AES-256-CBC Implementation
+        rkeys = _key_expansion_256(key_bytes)
+        pt_pure = bytearray()
+        prev = iv
+        for i in range(0, len(cipher_bytes), 16):
+            block = cipher_bytes[i:i+16]
+            dec_block = _aes_inv_cipher_block(block, rkeys)
+            pt_pure.extend(bytes(dec_block[j] ^ prev[j] for j in range(16)))
+            prev = block
+        return _unpad_pkcs7(bytes(pt_pure)).decode("utf-8")
 
     @classmethod
     def hmac_sha256(cls, data: str, working_key_base64: str) -> str:
@@ -222,7 +461,7 @@ class IvaCrypto:
 
     @classmethod
     def rsa_encrypt(cls, plaintext: str, public_key_str: str) -> str:
-        """RSA PKCS#1 v1.5 encryption. Output as lowercase hex."""
+        """RSA PKCS#1 v1.5 encryption output as lowercase hex."""
         modulus, exponent = cls._parse_public_key(public_key_str)
         data = plaintext.encode("utf-8")
         k = (modulus.bit_length() + 7) // 8
@@ -239,149 +478,140 @@ class IvaCrypto:
         em = bytes([0x00, 0x02]) + bytes(ps) + bytes([0x00]) + data
         m_int = int.from_bytes(em, "big")
         c_int = pow(m_int, exponent, modulus)
-        cipher_bytes = c_int.to_bytes(k, "big")
-        return cipher_bytes.hex().lower()
+        c_bytes = c_int.to_bytes(k, "big")
+        return c_bytes.hex().lower()
 
     @classmethod
-    def pichak_rsa_encrypt(cls, plaintext: str, public_key_str: str) -> str:
-        """Pichak RSA-OAEP SHA-256 / MGF1-SHA1. Output as base64."""
-        modulus, exponent = cls._parse_public_key(public_key_str)
-        data = plaintext.encode("utf-8")
-        k = (modulus.bit_length() + 7) // 8
-        h_len = hashlib.sha256().digest_size
-        if len(data) > k - 2 * h_len - 2:
-            raise ValueError("Message too long for RSA OAEP")
-
-        l_hash = hashlib.sha256(b"").digest()
-        ps = b"\x00" * (k - len(data) - 2 * h_len - 2)
-        db = l_hash + ps + b"\x01" + data
-        seed = secrets.token_bytes(h_len)
-
-        def mgf1(seed_bytes: bytes, mask_len: int) -> bytes:
-            t = bytearray()
-            counter = 0
-            while len(t) < mask_len:
-                c = counter.to_bytes(4, "big")
-                t.extend(hashlib.sha1(seed_bytes + c).digest())
-                counter += 1
-            return bytes(t[:mask_len])
-
-        db_mask = mgf1(seed, k - h_len - 1)
-        masked_db = bytes(a ^ b for a, b in zip(db, db_mask))
-        seed_mask = mgf1(masked_db, h_len)
-        masked_seed = bytes(a ^ b for a, b in zip(seed, seed_mask))
-
-        em = b"\x00" + masked_seed + masked_db
-        m_int = int.from_bytes(em, "big")
-        c_int = pow(m_int, exponent, modulus)
-        return base64.b64encode(c_int.to_bytes(k, "big")).decode("utf-8")
+    def _parse_public_key(cls, pem_or_modulus: str) -> Tuple[int, int]:
+        clean = pem_or_modulus.strip()
+        lines = [line for line in clean.splitlines() if not line.startswith("---")]
+        raw_b64 = "".join(lines).strip()
+        der = base64.b64decode(raw_b64)
+        return cls._parse_asn1_der(der)
 
     @classmethod
-    def _parse_public_key(cls, key_str: str) -> Tuple[int, int]:
-        s = key_str.strip()
-        if "BEGIN" in s:
-            lines = [line.strip() for line in s.splitlines() if not line.strip().startswith("-----")]
-            der = base64.b64decode("".join(lines))
-            return cls._parse_asn1_der(der)
+    def _parse_asn1_der(cls, der: bytes) -> Tuple[int, int]:
+        pos = 0
+        def read_len():
+            nonlocal pos
+            b = der[pos]
+            pos += 1
+            if b < 0x80:
+                return b
+            n = b & 0x7F
+            val = int.from_bytes(der[pos:pos+n], "big")
+            pos += n
+            return val
 
-        cleaned = s.replace("\r", "").replace("\n", "").replace(" ", "")
-        der = base64.b64decode(cleaned)
-        try:
-            return cls._parse_asn1_der(der)
-        except Exception:
-            return int.from_bytes(der, "big"), 65537
+        if der[pos] == 0x30:
+            pos += 1
+            read_len()
+            if der[pos] == 0x30:
+                pos += 1
+                seq_len = read_len()
+                pos += seq_len
+                if der[pos] == 0x03:
+                    pos += 1
+                    read_len()
+                    pos += 1  # unused bits
+                    if der[pos] == 0x30:
+                        pos += 1
+                        read_len()
+
+        if der[pos] == 0x02:
+            pos += 1
+            mod_len = read_len()
+            modulus = int.from_bytes(der[pos:pos+mod_len], "big")
+            pos += mod_len
+            if der[pos] == 0x02:
+                pos += 1
+                exp_len = read_len()
+                exponent = int.from_bytes(der[pos:pos+exp_len], "big")
+                return modulus, exponent
+
+        modulus = int.from_bytes(der, "big")
+        return modulus, 65537
 
     @classmethod
-    def _parse_asn1_der(cls, der_bytes: bytes) -> Tuple[int, int]:
-        i = 0
-        n_bytes = len(der_bytes)
-        integers = []
-        while i < n_bytes:
-            if der_bytes[i] == 0x02:  # INTEGER tag
-                i += 1
-                if i >= n_bytes:
-                    break
-                length = der_bytes[i]
-                i += 1
-                if length & 0x80:
-                    num_len = length & 0x7F
-                    length = int.from_bytes(der_bytes[i : i + num_len], "big")
-                    i += num_len
-                val = der_bytes[i : i + length]
-                i += length
-                integers.append(int.from_bytes(val, "big"))
+    def base64_modulus_to_pem(cls, modulus_base64: str) -> str:
+        mod_bytes = base64.b64decode(modulus_base64)
+        if mod_bytes[0] >= 0x80:
+            mod_bytes = b"\x00" + mod_bytes
+        exp_bytes = (65537).to_bytes(3, "big")
+
+        def encode_asn1(tag: int, val: bytes) -> bytes:
+            l = len(val)
+            if l < 0x80:
+                return bytes([tag, l]) + val
+            elif l <= 0xFF:
+                return bytes([tag, 0x81, l]) + val
             else:
-                i += 1
-        if len(integers) >= 2:
-            modulus = max(integers)
-            exponent = [x for x in integers if x != modulus and x < 65538]
-            return modulus, exponent[0] if exponent else 65537
-        raise ValueError("Could not parse RSA modulus from ASN.1 DER.")
+                return bytes([tag, 0x82, (l >> 8) & 0xFF, l & 0xFF]) + val
 
-    @classmethod
-    def base64_modulus_to_pem(cls, base64_modulus: str) -> str:
-        """Converts bare base64 RSA modulus into standard SPKI PEM block (exponent 65537)."""
-        spki_prefix = "30820122300d06092a864886f70d01010105000382010f003082010a0282010100"
-        spki_suffix = "0203010001"
-        cleaned_b64 = base64_modulus.replace("\r", "").replace("\n", "").replace(" ", "")
-        mod_hex = base64.b64decode(cleaned_b64).hex()
-        der_hex = spki_prefix + mod_hex + spki_suffix
-        b64 = base64.b64encode(bytes.fromhex(der_hex)).decode("utf-8")
-        lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
-        pem_body = "\n".join(lines)
-        return f"-----BEGIN PUBLIC KEY-----\n{pem_body}\n-----END PUBLIC KEY-----"
+        mod_asn1 = encode_asn1(0x02, mod_bytes)
+        exp_asn1 = encode_asn1(0x02, exp_bytes)
+        rsa_seq = encode_asn1(0x30, mod_asn1 + exp_asn1)
+        bit_str = encode_asn1(0x03, b"\x00" + rsa_seq)
+
+        alg_id = bytes([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00])
+        spki = encode_asn1(0x30, alg_id + bit_str)
+        b64 = base64.b64encode(spki).decode("ascii")
+        chunks = [b64[i:i+64] for i in range(0, len(b64), 64)]
+        return "-----BEGIN PUBLIC KEY-----\n" + "\n".join(chunks) + "\n-----END PUBLIC KEY-----\n"
 
 
 # ------------------------------------------------------------------------------
-# 3. Models & Exception Types
+# 3. Models & Data Structures
 # ------------------------------------------------------------------------------
-
-class IvaApiException(Exception):
-    def __init__(self, message: str, code: Optional[str] = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
 
 @dataclass
 class SessionData:
-    phone: str = ""
+    phone: Optional[str] = None
     token: Optional[str] = None
     refreshToken: Optional[str] = None
     expiresIn: Optional[int] = None
-    tokenType: Optional[str] = "Bearer"
     accessTokenObtainedAt: Optional[int] = None
+    rsaPublic: Optional[str] = None
     sharedKey: Optional[str] = None
     workingKey: Optional[str] = None
-    rsaPublic: Optional[str] = None
 
 
 @dataclass
 class CardPayment:
     pan: Optional[str] = None
+    pin: Optional[str] = None
     cvv2: Optional[str] = None
     expireMonth: Optional[str] = None
     expireYear: Optional[str] = None
-    pin: Optional[str] = None
     token: Optional[str] = None
 
     def validate(self) -> None:
         if not self.token and not self.pan:
-            raise ValueError("شماره کارت (PAN) یا توکن کارت الزامی است.")
+            raise ValueError("یا PAN یا Token باید مقداردهی شوند.")
+        if not self.pin:
+            raise ValueError("رمز دوم / رمز پویا الزامی است.")
+        if not self.cvv2:
+            raise ValueError("کد CVV2 الزامی است.")
 
 
 @dataclass
 class ChargePurchaseResult:
-    success: bool = False
-    errorCode: Optional[str] = None
-    message: Optional[str] = None
-    pin: Optional[str] = None
-    serial: Optional[str] = None
+    status_code: int
+    is_success: bool
+    status_title: Optional[str] = None
+    status_description: Optional[str] = None
+    error_message: Optional[str] = None
     trackingCode: Optional[str] = None
     transactionId: Optional[str] = None
     referenceNumber: Optional[str] = None
     status: Optional[str] = None
     cardHolderName: Optional[str] = None
+
+
+class IvaApiException(Exception):
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
 
 
 # ------------------------------------------------------------------------------
@@ -397,7 +627,7 @@ class FileSessionRepository:
         self._lock = asyncio.Lock()
 
     def _sanitize(self, val: str) -> Optional[str]:
-        if not val or not val.strip():
+        if not val or not str(val).strip():
             return None
         cleaned = "".join(c for c in str(val) if c.isalnum() or c in ("-", "_"))
         return cleaned if cleaned else None
@@ -522,31 +752,28 @@ class IvaAuthClient:
     }
 
     def __init__(self, telegram_user_id: int, phone: Optional[str] = None, repository: Optional[FileSessionRepository] = None):
-        self.telegram_user_id = telegram_user_id
+        self.user_id = telegram_user_id
         self.current_phone = phone
         self.repo = repository or FileSessionRepository()
-        self.session = SessionData(phone=phone or "")
+        self.session = SessionData(phone=phone)
         self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT)
 
-    async def load_session(self, phone: str) -> bool:
-        s = await self.repo.load(self.telegram_user_id, phone)
-        if s and s.token:
-            self.session = s
-            self.current_phone = phone
-            return True
-        return False
+    async def load_session(self, phone: str) -> None:
+        self.current_phone = phone
+        loaded = await self.repo.load(self.user_id, phone)
+        self.session = loaded if loaded else SessionData(phone=phone)
 
     async def save_session(self) -> None:
-        if self.current_phone and self.session:
+        if self.current_phone:
             self.session.phone = self.current_phone
-            await self.repo.save(self.telegram_user_id, self.session)
+            await self.repo.save(self.user_id, self.session)
 
-    def is_token_expired(self, skew_seconds: int = 30) -> bool:
-        obtained = self.session.accessTokenObtainedAt
-        expires_in = self.session.expiresIn
-        if not obtained or not expires_in:
+    def is_token_expired(self, buffer_seconds: int = 120) -> bool:
+        if not self.session.token:
+            return True
+        if not self.session.accessTokenObtainedAt or not self.session.expiresIn:
             return False
-        return time.time() >= (obtained + expires_in - skew_seconds)
+        return (time.time() - self.session.accessTokenObtainedAt) > (self.session.expiresIn - buffer_seconds)
 
     def apply_headers(self, path: str, serialized_body: Optional[str]) -> Dict[str, str]:
         headers = {
@@ -743,7 +970,6 @@ class IvaAuthClient:
         card.validate()
         await self.ensure_secure_channel()
 
-        # Build paymentMedia with AES encryption
         shared_key = self.session.sharedKey or ""
         media: Dict[str, Any] = {}
         if card.cvv2:
@@ -760,44 +986,29 @@ class IvaAuthClient:
             content_type = "application/vnd.sadad.payment.charge.Token+json"
         else:
             media["Pan"] = IvaCrypto.aes_encrypt(card.pan or "", shared_key)
-            content_type = "application/vnd.sadad.payment.charge.pan+json"
+            content_type = "application/vnd.sadad.payment.charge.Card+json"
 
-        body = {
-            "paymentMedia": media,
-            "Amount": amount,
-            "OrderId": int(time.time() * 1000),
-            "TargetMobileNo": target_mobile_no,
+        payload = {
             "ProviderId": provider_id,
-            "TTL": int(time.time() * 1000),
+            "Amount": amount,
+            "CellPhoneNumber": target_mobile_no,
+            "PaymentMedia": media
         }
 
-        path = "/v1/charges/pin/payment"
-        url = Config.get_base_address() + path
-        json_body = json.dumps(body, ensure_ascii=False)
-        headers = self.apply_headers(path, json_body)
+        url = Config.get_base_address() + "/v3/charges/pin/pay"
+        json_body = json.dumps(payload, ensure_ascii=False)
+        headers = self.apply_headers("/v3/charges/pin/pay", json_body)
         headers["Content-Type"] = content_type
 
         status, text = await self.http.request("POST", url, headers, json_body)
+        data = json.loads(text) if text.strip() else {}
 
-        if status == 401:
-            log_info("Received 401 on payment, auto-refreshing & retrying once...")
-            await self.refresh_auth()
-            return await self.buy_charge(provider_id, amount, target_mobile_no, card)
-
-        try:
-            doc = json.loads(text) if text.strip() else {}
-        except Exception:
-            return ChargePurchaseResult(success=False, errorCode=str(status), message=f"HTTP {status}")
-
-        err = doc.get("error")
-        if err and str(err.get("code")) not in ("200", "None", ""):
-            return ChargePurchaseResult(success=False, errorCode=str(err.get("code")), message=err.get("message"))
-
-        data = doc.get("data") or {}
         return ChargePurchaseResult(
-            success=True,
-            pin=data.get("pin"),
-            serial=data.get("serial"),
+            status_code=status,
+            is_success=(status in (200, 201, 204)),
+            status_title=data.get("statusTitle"),
+            status_description=data.get("statusDescription"),
+            error_message=data.get("errorMessage"),
             trackingCode=data.get("trackingCode"),
             transactionId=data.get("transactionId"),
             referenceNumber=data.get("referenceNumber"),
@@ -817,10 +1028,10 @@ user_active_phone: Dict[int, str] = {}
 class TelegramBot:
     """Async Telegram Bot controller utilizing standard Telegram Bot API."""
 
-    def __init__(self, token: str):
-        self.token = token.strip()
+    def __init__(self, token: Optional[str] = None):
+        self.token = (token or Config.get_bot_token()).strip()
         self.api_url = f"https://api.telegram.org/bot{self.token}"
-        self.http = AsyncHttpClient(timeout=30.0)
+        self.http = AsyncHttpClient(timeout=35.0)
         self.repo = FileSessionRepository()
         self.is_running = False
 
@@ -828,14 +1039,14 @@ class TelegramBot:
         url = f"{self.api_url}/{method}"
         body = json.dumps(payload or {})
         headers = {"Content-Type": "application/json"}
-        status, text = await self.http.request("POST", url, headers, body)
         try:
-            res = json.loads(text)
+            status, text = await self.http.request("POST", url, headers, body)
+            res = json.loads(text) if text.strip() else {}
             if not res.get("ok"):
-                log_error(f"Telegram API Error: {res.get('description')}")
+                log_error(f"Telegram API Error ({method}): {res.get('description')}")
             return res
         except Exception as ex:
-            log_error(f"Telegram Request Exception: {ex}")
+            log_error(f"Telegram Request Exception ({method}): {ex}")
             return {"ok": False, "description": str(ex)}
 
     async def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
@@ -851,7 +1062,8 @@ class TelegramBot:
         await self.call_api("answerCallbackQuery", payload)
 
     def is_admin(self, user_id: int) -> bool:
-        return Config.TELEGRAM_ADMIN_ID is not None and user_id == Config.TELEGRAM_ADMIN_ID
+        admin_id = Config.get_admin_id()
+        return admin_id is not None and user_id == admin_id
 
     def get_main_menu(self, is_logged_in: bool, phone: Optional[str] = None, user_id: Optional[int] = None) -> Dict[str, Any]:
         keyboard = [
@@ -876,7 +1088,6 @@ class TelegramBot:
                 {"text": "❓ راهنما", "callback_data": "menu_help"},
             ],
         ]
-        # Admin Panel Button (if user is admin)
         if user_id and self.is_admin(user_id):
             keyboard.append([{"text": "👑 پنل مدیریت (Admin)", "callback_data": "menu_admin"}])
 
@@ -896,7 +1107,7 @@ class TelegramBot:
             elif "callback_query" in update:
                 await self.handle_callback(update["callback_query"])
         except Exception as ex:
-            log_error(f"Error handling update: {ex}")
+            log_error(f"Error handling update: {ex}\n{traceback.format_exc()}")
 
     async def handle_message(self, msg: Dict[str, Any]) -> None:
         user_id = msg["from"]["id"]
@@ -943,7 +1154,6 @@ class TelegramBot:
             await self.show_admin_panel(chat_id)
             return
 
-        # State 1: Awaiting Phone Number for OTP
         if step == "auth_phone":
             phone = text.replace(" ", "")
             if not phone.startswith("09") or len(phone) != 11:
@@ -958,221 +1168,131 @@ class TelegramBot:
                     "step": "auth_otp",
                     "phone": phone,
                     "token": res.get("Token"),
-                    "reagent": res.get("ReagentNumber", "0"),
                 }
-                await self.send_message(chat_id, f"📩 کد تأیید پیامک‌شده به شماره <code>{phone}</code> را وارد نمایید:")
+                user_active_phone[user_id] = phone
+                await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{phone}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
             except Exception as ex:
-                user_states[user_id] = {}
-                await self.send_message(chat_id, f"❌ خطا در درخواست کد تأیید: {ex}")
+                await self.send_message(chat_id, f"❌ خطا در درخواست OTP: {ex}")
             return
 
-        # State 2: Awaiting OTP Code
         if step == "auth_otp":
-            otp = text.strip()
-            phone = state["phone"]
-            token = state["token"]
-            reagent = state.get("reagent", "0")
-
+            otp_code = text.strip()
+            phone = state.get("phone", "")
+            req_token = state.get("token", "")
             client = await self.get_client(user_id)
             client.current_phone = phone
-            await self.send_message(chat_id, "⏳ در حال تأیید کد و دریافت توکن‌ها...")
-            try:
-                await client.verify_code(otp, token, reagent)
-                await self.send_message(chat_id, "🔑 در حال تبادل کلیدهای امنیتی (Key Exchange)...")
-                await client.key_exchange()
 
+            await self.send_message(chat_id, "⏳ در حال اعتبارسنجی کد...")
+            try:
+                token_res = await client.verify_code(otp_code, req_token)
+                user_states[user_id] = {}
                 user_active_phone[user_id] = phone
-                user_states[user_id] = {}
 
-                success_text = (
-                    "✅ <b>احراز هویت با موفقیت انجام شد!</b>\n\n"
+                try:
+                    await client.key_exchange()
+                    key_msg = "✅ تبادل کلیدهای امنیتی AES نیز با موفقیت انجام شد."
+                except Exception as k_ex:
+                    key_msg = f"⚠️ هشدار در تبادل کلید: {k_ex}"
+
+                msg_success = (
+                    "🎉 <b>احراز هویت با موفقیت انجام شد!</b>\n\n"
                     f"📱 شماره: <code>{phone}</code>\n"
-                    "🔑 کلیدهای امنیتی تبادل و نشست در سرور ذخیره شد."
+                    f"⏱ مدت اعتبار توکن: <code>{token_res.get('expiresIn', 0)} ثانیه</code>\n"
+                    f"{key_msg}\n\n"
+                    "اکنون می‌توانید از تمام امکانات سامانه استفاده نمایید."
                 )
-                await self.send_message(chat_id, success_text, self.get_main_menu(True, phone, user_id))
+                await self.send_message(chat_id, msg_success, self.get_main_menu(True, phone, user_id))
             except Exception as ex:
-                user_states[user_id] = {}
-                await self.send_message(chat_id, f"❌ خطا در تأیید کد: {ex}")
+                await self.send_message(chat_id, f"❌ خطا در تأیید کد: {ex}\nلطفاً مجدداً کد را ارسال نمایید:")
             return
 
-        # State 3: Card Payment Inputs
-        if step == "charge_pan":
-            pan = text.replace(" ", "").replace("-", "")
-            if len(pan) != 16 or not pan.isdigit():
-                await self.send_message(chat_id, "❌ شماره کارت باید ۱۶ رقم باشد. لطفاً مجدداً وارد فرمایید:")
-                return
-            state["pan"] = pan
-            state["step"] = "charge_cvv"
-            await self.send_message(chat_id, "🔐 کد CVV2 کارت را وارد نمایید:")
-            return
-
-        if step == "charge_cvv":
-            state["cvv2"] = text.strip()
-            state["step"] = "charge_pin"
-            await self.send_message(chat_id, "🔑 رمز اینترنتی پویا (PIN2) را وارد نمایید:")
-            return
-
-        if step == "charge_pin":
-            state["pin"] = text.strip()
-            state["step"] = "charge_exp"
-            await self.send_message(chat_id, "📅 تاریخ انقضا کارت را به صورت ۴ رقم (سال و ماه مانند <code>0512</code>) وارد نمایید:")
-            return
-
-        if step == "charge_exp":
-            exp = text.strip()
-            state["expYear"] = exp[:2]
-            state["expMonth"] = exp[2:4] if len(exp) >= 4 else "01"
-
-            await self.send_message(chat_id, "⏳ در حال رمزنگاری فیلدها و ارسال تراکنش به سداد...")
-            client = await self.get_client(user_id)
-            try:
-                card = CardPayment(
-                    pan=state["pan"],
-                    cvv2=state["cvv2"],
-                    expireMonth=state["expMonth"],
-                    expireYear=state["expYear"],
-                    pin=state["pin"],
-                )
-                res = await client.buy_charge(
-                    provider_id=state.get("provider", "MCI"),
-                    amount=state.get("amount", 10000),
-                    target_mobile_no=state.get("target_phone", client.current_phone or "09120000000"),
-                    card=card,
-                )
-                user_states[user_id] = {}
-                if res.success:
-                    succ = (
-                        "✅ <b>خرید شارژ با موفقیت انجام شد!</b>\n\n"
-                        f"کد پین شارژ: <code>{res.pin}</code>\n"
-                        f"شماره سریال: <code>{res.serial}</code>\n"
-                        f"کد پیگیری: <code>{res.trackingCode}</code>\n"
-                        f"شماره تراکنش: <code>{res.transactionId}</code>\n"
-                        f"شماره مرجع: <code>{res.referenceNumber}</code>"
-                    )
-                    await self.send_message(chat_id, succ)
-                else:
-                    await self.send_message(chat_id, f"❌ تراکنش ناموفق بود: {res.message} (کد: {res.errorCode})")
-            except Exception as ex:
-                user_states[user_id] = {}
-                await self.send_message(chat_id, f"❌ خطای پرداخت: {ex}")
-            return
+        # Default fallback
+        client = await self.get_client(user_id)
+        is_connected = bool(client.session.token)
+        await self.send_message(chat_id, "برای استفاده از ربات از دکمه‌های زیر استفاده کنید:", self.get_main_menu(is_connected, client.current_phone, user_id))
 
     async def handle_callback(self, query: Dict[str, Any]) -> None:
         user_id = query["from"]["id"]
         chat_id = query["message"]["chat"]["id"]
         data = query.get("data", "")
-        callback_id = query["id"]
+        await self.answer_callback(query["id"])
 
-        known_users.add(user_id)
-        await self.answer_callback(callback_id)
         client = await self.get_client(user_id)
 
         if data == "menu_auth":
             user_states[user_id] = {"step": "auth_phone"}
-            await self.send_message(chat_id, "📱 لطفاً شماره تلفن همراه خود را ارسال فرمایید (مثال: <code>09120000000</code>):")
+            await self.send_message(chat_id, "📱 لطفاً شماره تلفن همراه خود را ارسال کنید:\nمثال: <code>09121234567</code>")
             return
 
         if data == "menu_profile":
             if not client.session.token:
-                await self.send_message(chat_id, "⚠️ حسابی فعال نیست. لطفاً ابتدا از منوی 🔐 احراز هویت لاگین فرمایید.")
+                await self.send_message(chat_id, "❌ شما هنوز وارد نشده‌اید. ابتدا از بخش 🔐 احراز هویت وارد شوید.")
                 return
-            await self.send_message(chat_id, "⏳ در حال استعلام مشخصات کاربری از <code>/v1/users/me</code>...")
+            await self.send_message(chat_id, "⏳ در حال دریافت اطلاعات پروفایل...")
             try:
-                prof = await client.get_profile()
-                msg = (
-                    "👤 <b>اطلاعات حساب کاربری IVA</b>\n\n"
-                    f"شناسه کاربر: <code>{prof.get('userId', '—')}</code>\n"
-                    f"شماره همراه: <code>{prof.get('phoneNumber', client.current_phone)}</code>\n"
-                    f"نام نمایشی: <code>{prof.get('displayName', '—')}</code>\n"
-                    f"وضعیت توکن: <b>فعال و معتبر</b>"
+                profile = await client.get_profile()
+                prof_text = (
+                    "👤 <b>اطلاعات پروفایل کاربری:</b>\n\n"
+                    f"نام و نام‌خانوادگی: <code>{profile.get('firstName', '')} {profile.get('lastName', '')}</code>\n"
+                    f"کد ملی: <code>{profile.get('nationalCode', '---')}</code>\n"
+                    f"شماره همراه: <code>{profile.get('cellPhoneNumber', client.current_phone)}</code>\n"
+                    f"شناسه کاربر: <code>{profile.get('userId', '---')}</code>"
                 )
-                await self.send_message(chat_id, msg)
+                await self.send_message(chat_id, prof_text)
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در دریافت پروفایل: {ex}")
+                await self.send_message(chat_id, f"❌ خطای دریافت اطلاعات: {ex}")
             return
 
         if data == "menu_refresh":
             if not client.session.refreshToken:
-                await self.send_message(chat_id, "⚠️ رفرش‌توکن موجود نیست. لطفاً ابتدا لاگین فرمایید.")
+                await self.send_message(chat_id, "❌ رفرش‌توکن ذخیره‌شده‌ای یافت نشد. لطفاً از طریق 🔐 احراز هویت مجدداً وارد شوید.")
                 return
-            await self.send_message(chat_id, "⏳ در حال ارسال درخواست تمدید توکن...")
+            await self.send_message(chat_id, "🔄 در حال تمدید اکسس‌توکن...")
             try:
-                await client.refresh_auth()
-                await self.send_message(chat_id, "✅ توکن با موفقیت تمدید و کلیدهای امنیتی به‌روزرسانی شدند.")
+                res = await client.refresh_token()
+                await self.send_message(chat_id, f"✅ توکن با موفقیت تمدید شد!\nمدت اعتبار: <code>{res.get('expiresIn', 0)} ثانیه</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در تمدید توکن: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تمدید توکن: {ex}")
             return
 
         if data == "menu_keyexchange":
-            await self.send_message(chat_id, "⏳ در حال اجرای Key Exchange با سرور سداد...")
+            await self.send_message(chat_id, "🔑 در حال انجام تبادل کلید با سرور IVA...")
             try:
                 await client.key_exchange()
-                await self.send_message(chat_id, "✅ تبادل کلید با موفقیت انجام شد. جفت‌کلیدهای DataKey و MacKey فعال هستند.")
+                await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود و کانال ارتباطی امن شد.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در تبادل کلید: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تبادل کلید: {ex}")
             return
 
         if data == "menu_configs":
-            await self.send_message(chat_id, "⏳ در حال دریافت تنظیمات اپلیکیشن از سرور...")
-            try:
-                await client.try_discover_public_key()
-                has_key = bool(client.session.rsaPublic)
-                msg = (
-                    "📱 <b>اطلاعات و پیکربندی IVA</b>\n\n"
-                    f"آدرس پایه: <code>{Config.API_BASE_URL}</code>\n"
-                    f"پیشوند API: <code>{Config.API_PREFIX}</code>\n"
-                    f"نسخه برنامه: <code>{Config.APP_VERSION}</code>\n"
-                    f"کلید عمومی سرور: <b>{'✅ کشف و ذخیره شده' if has_key else '❌ موجود نیست'}</b>"
-                )
-                await self.send_message(chat_id, msg)
-            except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در استعلام پیکربندی: {ex}")
+            info_text = (
+                "📱 <b>اطلاعات پیکربندی و سرورهای IVA / Sadad:</b>\n\n"
+                f"آدرس پایه: <code>{Config.API_BASE_URL}</code>\n"
+                f"پیشوند API: <code>{Config.API_PREFIX}</code>\n"
+                f"نسخه PWA: <code>{Config.APP_VERSION}</code>\n"
+                f"محیط رمزنگاری: <b>{'Cryptography Module' if _HAS_CRYPTOGRAPHY else 'Native libcrypto / Pure-Python'}</b>"
+            )
+            await self.send_message(chat_id, info_text)
             return
 
         if data == "menu_charge":
-            if not client.session.token:
-                await self.send_message(chat_id, "⚠️ لطفاً ابتدا احراز هویت فرمایید.")
-                return
-            await self.send_message(chat_id, "⏳ در حال دریافت کاتالوگ شارژ از <code>/v3/charges/pin/mobile/catalog</code>...")
+            await self.send_message(chat_id, "⏳ در حال دریافت کاتالوگ شارژ...")
             try:
                 catalog = await client.get_charge_catalog()
-                user_states[user_id] = {
-                    "step": "charge_pan",
-                    "provider": catalog[0].get("code", "MCI") if catalog else "MCI",
-                    "amount": 10000,
-                    "target_phone": client.current_phone or "09120000000",
-                }
-                msg = (
-                    "💳 <b>خرید شارژ پین (تست پرداخت)</b>\n\n"
-                    f"اپراتور انتخابی: <b>{user_states[user_id]['provider']}</b>\n"
-                    f"مبلغ: <b>۱۰,۰۰۰ ریال</b>\n"
-                    f"شماره مقصد: <code>{user_states[user_id]['target_phone']}</code>\n\n"
-                    "⚠️ <i>توجه: اطلاعات کارت پیش از ارسال با AES-256 رمزنگاری شده و ذخیره نمی‌شود.</i>\n\n"
-                    "لطفاً شماره کارت ۱۶ رقمی را ارسال فرمایید:"
-                )
-                await self.send_message(chat_id, msg)
+                await self.send_message(chat_id, f"📦 کاتالوگ بسته‌های شارژ دریافت شد.\nتعداد موارد: <code>{len(catalog)}</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در دریافت کاتالوگ: {ex}")
+                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ: {ex}")
             return
 
         if data == "menu_status":
-            has_tok = bool(client.session.token)
-            has_rt = bool(client.session.refreshToken)
+            is_token_exp = client.is_token_expired()
             has_shared = bool(client.session.sharedKey)
             has_working = bool(client.session.workingKey)
             has_rsa = bool(client.session.rsaPublic)
-
-            exp_text = "—"
-            if client.session.accessTokenObtainedAt and client.session.expiresIn:
-                rem = (client.session.accessTokenObtainedAt + client.session.expiresIn) - int(time.time())
-                exp_text = f"{max(0, rem)} ثانیه"
-
             status_msg = (
-                "📊 <b>وضعیت نشست جاری کاربر</b>\n\n"
-                f"شماره فعال: <code>{client.current_phone or '—'}</code>\n"
-                f"اکسس توکن: <b>{'✅ موجود' if has_tok else '❌ ناموجود'}</b>\n"
-                f"رفرش توکن: <b>{'✅ موجود' if has_rt else '❌ ناموجود'}</b>\n"
-                f"اعتبار باقی‌مانده: <code>{exp_text}</code>\n"
+                "📊 <b>وضعیت نشست جاری:</b>\n\n"
+                f"شماره فعال: <code>{client.current_phone or 'نامشخص'}</code>\n"
+                f"وضعیت توکن: <b>{'❌ منقضی یا ناموجود' if is_token_exp else '🟢 معتبر'}</b>\n"
                 f"کلید AES متقارن (DataKey): <b>{'✅ آماده' if has_shared else '❌ ناموجود'}</b>\n"
                 f"کلید امضا HMAC (MacKey): <b>{'✅ آماده' if has_working else '❌ ناموجود'}</b>\n"
                 f"کلید عمومی RSA سرور: <b>{'✅ موجود' if has_rsa else '❌ ناموجود'}</b>"
@@ -1312,8 +1432,17 @@ class TelegramBot:
         log_info("Telegram Bot Starting... (Ready for Termux / Linux)")
         log_info(f"Session directory: {Config.SESSION_DIR}")
         log_info(f"Log file: {log_file_path}")
-        if Config.TELEGRAM_ADMIN_ID:
-            log_info(f"Admin ID configured: {Config.TELEGRAM_ADMIN_ID}")
+        admin_id = Config.get_admin_id()
+        if admin_id:
+            log_info(f"Admin ID configured: {admin_id}")
+
+        # Check getMe on startup
+        me_res = await self.call_api("getMe")
+        if me_res.get("ok"):
+            bot_user = me_res.get("result", {})
+            log_info(f"Connected to Telegram API as @{bot_user.get('username')} (ID: {bot_user.get('id')})")
+        else:
+            log_error(f"Telegram getMe check failed: {me_res.get('description')}")
 
         offset = 0
         while self.is_running:
@@ -1359,9 +1488,13 @@ async def run_health_check() -> bool:
 
 
 async def main() -> None:
-    await run_health_check()
-    bot = TelegramBot(Config.TELEGRAM_BOT_TOKEN)
-    await bot.start_polling()
+    try:
+        await run_health_check()
+        bot = TelegramBot(Config.get_bot_token())
+        await bot.start_polling()
+    except Exception as ex:
+        log_error(f"Fatal error during bot execution: {ex}\n{traceback.format_exc()}")
+        raise
 
 
 if __name__ == "__main__":
