@@ -717,8 +717,9 @@ class FileSessionRepository:
 class AsyncHttpClient:
     """Async HTTP executor using standard library asyncio + urllib with Sadad/Iranian TLS support."""
 
-    def __init__(self, timeout: float = 65.0):
+    def __init__(self, timeout: float = 65.0, proxy: Optional[str] = None):
         self.timeout = timeout
+        self.proxy = proxy
         self.ssl_context = self._build_tls_context()
 
     @staticmethod
@@ -763,8 +764,15 @@ class AsyncHttpClient:
     def _sync_request(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]) -> Tuple[int, str]:
         req_data = body.encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=req_data, headers=headers, method=method)
+
+        handlers = []
+        if self.proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
+        handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
+        opener = urllib.request.build_opener(*handlers)
+
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_context) as resp:
+            with opener.open(req, timeout=self.timeout) as resp:
                 status = resp.getcode()
                 resp_text = resp.read().decode("utf-8")
                 return status, resp_text
@@ -776,7 +784,7 @@ class AsyncHttpClient:
             err_msg = str(ex)
 
             # Secondary fallback for TLS Handshake alerts
-            if "SSL" in err_msg or "HANDSHAKE" in err_msg:
+            if "SSL" in err_msg or "HANDSHAKE" in err_msg or "EOF" in err_msg:
                 try:
                     alt_ctx = ssl._create_unverified_context()
                     if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
@@ -785,7 +793,14 @@ class AsyncHttpClient:
                         alt_ctx.options |= 0x4
                     alt_ctx.check_hostname = False
                     alt_ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(req, timeout=self.timeout, context=alt_ctx) as resp:
+
+                    alt_handlers = []
+                    if self.proxy:
+                        alt_handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
+                    alt_handlers.append(urllib.request.HTTPSHandler(context=alt_ctx))
+                    alt_opener = urllib.request.build_opener(*alt_handlers)
+
+                    with alt_opener.open(req, timeout=self.timeout) as resp:
                         return resp.getcode(), resp.read().decode("utf-8")
                 except urllib.error.HTTPError as hex_err:
                     return hex_err.code, hex_err.read().decode("utf-8", errors="replace")
@@ -795,14 +810,15 @@ class AsyncHttpClient:
             if "timed out" in err_msg or "Timeout" in err_msg:
                 raise IvaApiException("مهلت اتصال به سرور ایوا به پایان رسید (Connection Timeout).")
             elif "Name or service not known" in err_msg or "getaddrinfo failed" in err_msg:
-                raise IvaApiException("عدم دسترسی به سرور ایوا (DNS/Host Error). در صورت فعال بودن VPN، آن را بررسی فرمایید.")
+                raise IvaApiException("عدم دسترسی به سرور ایوا (DNS/Host Error).")
             elif "Connection refused" in err_msg:
                 raise IvaApiException("اتصال به سرور ایوا برقرار نشد (Connection Refused).")
-            elif "SSL" in err_msg or "CERTIFICATE" in err_msg or "HANDSHAKE" in err_msg:
+            elif "SSL" in err_msg or "CERTIFICATE" in err_msg or "HANDSHAKE" in err_msg or "EOF" in err_msg:
                 raise IvaApiException(
-                    f"خطای امنیتی گواهی SSL سرور ایوا:\n{err_msg}\n\n"
-                    "💡 راهنما: سرورهای پرداخت سداد/ایوا در شبکه ملی اینترنت قرار دارند. "
-                    "در صورت فعال بودن فیلترشکن، ممکن است اتصال مستقیم TLS مسدود گردد."
+                    f"خطای امنیتی گواهی SSL یا فیلترینگ جغرافیایی سرور ایوا:\n{clean_html(err_msg)}\n\n"
+                    "💡 راهنمای رفع مشکل:\n"
+                    "سرورهای پرداخت سداد/ایوا به دلیل مسائل امنیتی، آی‌پی‌های خارج از ایران (فیلترشکن‌ها) را مسدود یا ریست (EOF) می‌کنند.\n"
+                    "در نرم‌افزار وی‌پی‌ان خود گزینه «Bypass Iran / مستثنی کردن سایت‌های ایرانی» را فعال کنید یا از قابلیت TELEGRAM_PROXY استفاده فرمایید."
                 )
             else:
                 raise IvaApiException(f"خطای ارتباط شبکه: {err_msg}")
@@ -828,7 +844,9 @@ class IvaAuthClient:
         self.current_phone = phone
         self.repo = repository or FileSessionRepository()
         self.session = SessionData(phone=phone)
-        self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT)
+        # IVA API connects directly (or via optional IVA_PROXY if specified)
+        iva_proxy = os.getenv("IVA_PROXY", "").strip() or None
+        self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT, proxy=iva_proxy)
 
     async def load_session(self, phone: str) -> None:
         self.current_phone = phone
@@ -849,8 +867,14 @@ class IvaAuthClient:
 
     def apply_headers(self, path: str, serialized_body: Optional[str]) -> Dict[str, str]:
         headers = {
-            "Accept": "application/json",
-            "User-Agent": f"IVA-PWA-Client/{Config.APP_VERSION}",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": f"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 IVA-PWA-Client/{Config.APP_VERSION}",
+            "Origin": "https://ivaapp.ir",
+            "Referer": "https://ivaapp.ir/",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
         }
         if self.session.token:
             headers["Authorization"] = f"Bearer {self.session.token}"
@@ -1103,7 +1127,8 @@ class TelegramBot:
     def __init__(self, token: Optional[str] = None):
         self.token = (token or Config.get_bot_token()).strip()
         self.api_url = f"https://api.telegram.org/bot{self.token}"
-        self.http = AsyncHttpClient(timeout=35.0)
+        telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
+        self.http = AsyncHttpClient(timeout=35.0, proxy=telegram_proxy)
         self.repo = FileSessionRepository()
         self.is_running = False
 
@@ -1253,7 +1278,7 @@ class TelegramBot:
                 user_active_phone[user_id] = phone
                 await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{clean_html(phone)}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در درخواست OTP:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطا در درخواست OTP:\n{clean_html(ex)}")
             return
 
         if step == "auth_otp":
@@ -1284,7 +1309,7 @@ class TelegramBot:
                 )
                 await self.send_message(chat_id, msg_success, self.get_main_menu(True, phone, user_id))
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در تأیید کد:\n<code>{clean_html(ex)}</code>\nلطفاً مجدداً کد را ارسال نمایید:")
+                await self.send_message(chat_id, f"❌ خطا در تأیید کد:\n{clean_html(ex)}\nلطفاً مجدداً کد را ارسال نمایید:")
             return
 
         # Default fallback
@@ -1321,7 +1346,7 @@ class TelegramBot:
                 )
                 await self.send_message(chat_id, prof_text)
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای دریافت اطلاعات:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای دریافت اطلاعات:\n{clean_html(ex)}")
             return
 
         if data == "menu_refresh":
@@ -1333,7 +1358,7 @@ class TelegramBot:
                 res = await client.refresh_token()
                 await self.send_message(chat_id, f"✅ توکن با موفقیت تمدید شد!\nمدت اعتبار: <code>{res.get('expiresIn', 0)} ثانیه</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تمدید توکن:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای تمدید توکن:\n{clean_html(ex)}")
             return
 
         if data == "menu_keyexchange":
@@ -1342,7 +1367,7 @@ class TelegramBot:
                 await client.key_exchange()
                 await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود و کانال ارتباطی امن شد.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تبادل کلید:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای تبادل کلید:\n{clean_html(ex)}")
             return
 
         if data == "menu_configs":
@@ -1362,7 +1387,7 @@ class TelegramBot:
                 catalog = await client.get_charge_catalog()
                 await self.send_message(chat_id, f"📦 کاتالوگ بسته‌های شارژ دریافت شد.\nتعداد موارد: <code>{len(catalog)}</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ:\n{clean_html(ex)}")
             return
 
         if data == "menu_status":
@@ -1428,7 +1453,7 @@ class TelegramBot:
                 res = await client.get_profile()
                 await self.send_message(chat_id, f"✅ خروجی موفق <code>/v1/users/me</code>:\n<code>{clean_html(json.dumps(res, ensure_ascii=False)[:300])}</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /users/me:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای تست /users/me:\n{clean_html(ex)}")
             return
 
         if data == "test_configs":
@@ -1436,7 +1461,7 @@ class TelegramBot:
                 await client.try_discover_public_key()
                 await self.send_message(chat_id, "✅ خروجی موفق <code>/v1/baseInfo/configs/list</code>.\nکلید RSA سرور ثبت شد.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /configs/list:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای تست /configs/list:\n{clean_html(ex)}")
             return
 
         if data == "test_catalog":
@@ -1444,7 +1469,7 @@ class TelegramBot:
                 res = await client.get_charge_catalog()
                 await self.send_message(chat_id, f"✅ خروجی موفق <code>/v3/charges/pin/mobile/catalog</code>:\nتعداد اپراتورها: {len(res)}")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /catalog:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای تست /catalog:\n{clean_html(ex)}")
             return
 
         if data == "test_keyex":
@@ -1452,7 +1477,7 @@ class TelegramBot:
                 await client.key_exchange()
                 await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای Key Exchange:\n<code>{clean_html(ex)}</code>")
+                await self.send_message(chat_id, f"❌ خطای Key Exchange:\n{clean_html(ex)}")
             return
 
         if data == "menu_help":
