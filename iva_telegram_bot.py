@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-IVA / Sadad Android & Linux Unified Telegram Bot & API Client
+IVA / Sadad Android & Linux Unified Telegram Bot & Terminal API Client
 ================================================================================
 Compatible with:
   - Android Termux (aarch64 / arm64 / armv7l / x86_64)
   - Python 3.10, 3.11, 3.12, 3.13, 3.14+
   - Zero mandatory external dependencies (pure standard library + optional cryptography/aiohttp)
+  - Dual Mode: Interactive Terminal CLI & Async Telegram Bot
 ================================================================================
 """
 
@@ -624,7 +625,7 @@ class IvaApiException(Exception):
 # ------------------------------------------------------------------------------
 
 class FileSessionRepository:
-    """Thread-safe & atomic session repository isolated per Telegram User ID and Phone."""
+    """Thread-safe & atomic session repository isolated per Telegram/Terminal User ID and Phone."""
 
     def __init__(self, base_directory: Optional[str] = None):
         self.base_dir = os.path.abspath(base_directory or Config.SESSION_DIR)
@@ -730,16 +731,14 @@ class AsyncHttpClient:
         except Exception:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
-        # Legacy renegotiation flags for banking gateways
         if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
             ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
         else:
-            ctx.options |= 0x4  # SSL_OP_LEGACY_SERVER_CONNECT
+            ctx.options |= 0x4
 
         if hasattr(ssl, "OP_DONT_INSERT_EMPTY_FRAGMENTS"):
             ctx.options |= ssl.OP_DONT_INSERT_EMPTY_FRAGMENTS
 
-        # Ciphers compatibility (SECLEVEL=1 allows SHA-1 and 1024/2048-bit RSA domestic certs)
         for cipher_suite in [
             "DEFAULT:@SECLEVEL=1:ALL:!aNULL:!eNULL",
             "HIGH:MEDIUM:@SECLEVEL=1:!aNULL:!eNULL",
@@ -752,7 +751,6 @@ class AsyncHttpClient:
             except Exception:
                 pass
 
-        # Relax verification for domestic gateways
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
@@ -818,7 +816,7 @@ class AsyncHttpClient:
                     f"خطای امنیتی گواهی SSL یا فیلترینگ جغرافیایی سرور ایوا:\n{clean_html(err_msg)}\n\n"
                     "💡 راهنمای رفع مشکل:\n"
                     "سرورهای پرداخت سداد/ایوا به دلیل مسائل امنیتی، آی‌پی‌های خارج از ایران (فیلترشکن‌ها) را مسدود یا ریست (EOF) می‌کنند.\n"
-                    "در نرم‌افزار وی‌پی‌ان خود گزینه «Bypass Iran / مستثنی کردن سایت‌های ایرانی» را فعال کنید یا از قابلیت TELEGRAM_PROXY استفاده فرمایید."
+                    "در نرم‌افزار وی‌پی‌ان خود گزینه «Bypass Iran / مستثنی کردن سایت‌های ایرانی» را فعال کنید."
                 )
             else:
                 raise IvaApiException(f"خطای ارتباط شبکه: {err_msg}")
@@ -839,12 +837,11 @@ class IvaAuthClient:
         "/v1/users/auth/refreshtoken",
     }
 
-    def __init__(self, telegram_user_id: int, phone: Optional[str] = None, repository: Optional[FileSessionRepository] = None):
+    def __init__(self, telegram_user_id: int = 1001, phone: Optional[str] = None, repository: Optional[FileSessionRepository] = None):
         self.user_id = telegram_user_id
         self.current_phone = phone
         self.repo = repository or FileSessionRepository()
         self.session = SessionData(phone=phone)
-        # IVA API connects directly (or via optional IVA_PROXY if specified)
         iva_proxy = os.getenv("IVA_PROXY", "").strip() or None
         self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT, proxy=iva_proxy)
 
@@ -1114,7 +1111,158 @@ class IvaAuthClient:
 
 
 # ------------------------------------------------------------------------------
-# 6. Telegram Bot Controller (Async Polling Engine)
+# 6. Interactive Terminal CLI Interface
+# ------------------------------------------------------------------------------
+
+async def run_terminal_cli() -> None:
+    """Complete interactive Terminal CLI for login, profile and testing without Telegram."""
+    repo = FileSessionRepository()
+    user_id = 1001  # Terminal default user ID
+    current_phone: Optional[str] = None
+
+    phones = await repo.list_phones(user_id)
+    if phones:
+        current_phone = phones[-1]
+
+    client = IvaAuthClient(telegram_user_id=user_id, phone=current_phone, repository=repo)
+    if current_phone:
+        await client.load_session(current_phone)
+
+    loop = asyncio.get_running_loop()
+
+    def ask(prompt: str) -> str:
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return "0"
+
+    print("\n" + "=" * 60)
+    print("🏦 سامانه ترمینال احراز هویت و مدیریت IVA / Sadad")
+    print("=" * 60)
+
+    while True:
+        is_logged_in = bool(client.session.token)
+        print("\n" + "-" * 55)
+        status_lbl = "🟢 متصل و معتبر" if (is_logged_in and not client.is_token_expired()) else ("⚠️ توکن منقضی" if is_logged_in else "⚪ لاگین نشده")
+        print(f"📱 شماره فعال: {client.current_phone or 'تعیین نشده'} | وضعیت: {status_lbl}")
+        print("-" * 55)
+        print("1. 🔐 احراز هویت مستقیم با شماره موبایل و کد پیامکی (OTP)")
+        print("2. 👤 دریافت اطلاعات حساب و پروفایل کاربری (/v1/users/me)")
+        print("3. 🔄 تمدید توکن احراز هویت (RefreshToken)")
+        print("4. 🔑 انجام تبادل کلید امنیتی (KeyExchange)")
+        print("5. 📱 دریافت اطلاعات پایه و کاتالوگ شارژ")
+        print("6. 📋 مشاهده و تعویض حساب‌های ذخیره‌شده")
+        print("7. 🤖 اجرای ربات تلگرام (Telegram Bot Polling)")
+        print("0. ❌ خروج")
+        print("-" * 55)
+
+        choice = await loop.run_in_executor(None, ask, "👉 شماره گزینه را وارد فرمایید [0-7]: ")
+
+        if choice == "0":
+            print("\n👋 خروج از سامانه ترمینال.")
+            break
+
+        elif choice == "1":
+            phone = await loop.run_in_executor(None, ask, "\n📱 شماره موبایل را وارد نمایید (مثال: 09121234567): ")
+            phone = phone.replace(" ", "")
+            if not phone.startswith("09") or len(phone) != 11:
+                print("❌ فرمت شماره اشتباه است. شماره باید ۱۱ رقمی بوده و با 09 شروع شود.")
+                continue
+
+            print("⏳ در حال ارسال شماره به سرور ایوا جهت دریافت کد پیامکی...")
+            try:
+                res = await client.request_otp(phone)
+                req_token = res.get("Token", "")
+                print(f"✅ پیامک حاوی کد با موفقیت به شماره {phone} ارسال گردید.")
+
+                otp_code = await loop.run_in_executor(None, ask, "📩 کد ۵ رقمی پیامک‌شده را وارد نمایید: ")
+                print("⏳ در حال اعتبارسنجی کد در سرور سداد...")
+                client.current_phone = phone
+                token_res = await client.verify_code(otp_code, req_token)
+
+                print("⏳ در حال تبادل کلیدهای امنیتی AES...")
+                try:
+                    await client.key_exchange()
+                    print("✅ تبادل کلید AES با موفقیت انجام شد.")
+                except Exception as k_ex:
+                    print(f"⚠️ توجه در تبادل کلید: {k_ex}")
+
+                print("\n🎉 احراز هویت با موفقیت کامل انجام شد و سشن ذخیره گردید!")
+                print(f"⏱ مدت زمان اعتبار توکن: {token_res.get('expiresIn', 0)} ثانیه")
+            except Exception as ex:
+                print(f"\n❌ خطا در فرآیند احراز هویت: {ex}")
+
+        elif choice == "2":
+            if not client.session.token:
+                print("❌ شما هنوز لاگین نکرده‌اید. لطفاً ابتدا گزینه ۱ را اجرا کنید.")
+                continue
+            print("⏳ در حال استعلام اطلاعات کاربری از سرور...")
+            try:
+                prof = await client.get_profile()
+                print("\n👤 مشخصات پروفایل کاربری:")
+                print(f"• نام و نام‌خانوادگی: {prof.get('firstName', '')} {prof.get('lastName', '')}")
+                print(f"• کد ملی: {prof.get('nationalCode', '---')}")
+                print(f"• شماره همراه: {prof.get('cellPhoneNumber', client.current_phone)}")
+                print(f"• شناسه کاربری: {prof.get('userId', '---')}")
+            except Exception as ex:
+                print(f"❌ خطا در دریافت اطلاعات: {ex}")
+
+        elif choice == "3":
+            if not client.session.refreshToken:
+                print("❌ رفرش‌توکن ذخیره‌شده‌ای موجود نیست.")
+                continue
+            print("⏳ در حال تمدید توکن...")
+            try:
+                res = await client.refresh_token()
+                print(f"✅ اکسس‌توکن جدید دریافت شد! اعتبار: {res.get('expiresIn', 0)} ثانیه")
+            except Exception as ex:
+                print(f"❌ خطا در تمدید توکن: {ex}")
+
+        elif choice == "4":
+            print("⏳ در حال اجرای KeyExchange با سرور...")
+            try:
+                await client.key_exchange()
+                print("✅ کانال امن شد و کلیدهای متقارن در سرور ثبت شدند.")
+            except Exception as ex:
+                print(f"❌ خطا در تبادل کلید: {ex}")
+
+        elif choice == "5":
+            print("⏳ در حال استعلام کاتالوگ بسته‌های شارژ...")
+            try:
+                cat = await client.get_charge_catalog()
+                print(f"✅ کاتالوگ با موفقیت دریافت شد. تعداد موارد: {len(cat)}")
+                for item in cat[:5]:
+                    print(f"  • {item.get('title', item.get('name', item))}")
+            except Exception as ex:
+                print(f"❌ خطا در دریافت کاتالوگ: {ex}")
+
+        elif choice == "6":
+            saved_phones = await repo.list_phones(user_id)
+            if not saved_phones:
+                print("📭 هیچ حسابی ذخیره نشده است.")
+                continue
+            print("\n📋 لیست حساب‌های ذخیره‌شده:")
+            for idx, p in enumerate(saved_phones, 1):
+                active_mark = " (فعال)" if p == client.current_phone else ""
+                print(f"  {idx}. {p}{active_mark}")
+            sel = await loop.run_in_executor(None, ask, "شماره ردیف حساب موردنظر را وارد کنید (یا Enter برای برگشت): ")
+            if sel.isdigit() and 1 <= int(sel) <= len(saved_phones):
+                selected_phone = saved_phones[int(sel)-1]
+                await client.load_session(selected_phone)
+                print(f"✅ حساب فعال به {selected_phone} تغییر یافت.")
+
+        elif choice == "7":
+            token = Config.get_bot_token()
+            if not token:
+                print("❌ توکن تلگرام تنظیم نشده است (TELEGRAM_BOT_TOKEN).")
+                continue
+            print("🤖 در حال اجرای ربات تلگرام...")
+            bot = TelegramBot(token)
+            await bot.start_polling()
+
+
+# ------------------------------------------------------------------------------
+# 7. Telegram Bot Controller (Async Polling Engine)
 # ------------------------------------------------------------------------------
 
 user_states: Dict[int, Dict[str, Any]] = {}
@@ -1528,10 +1676,8 @@ class TelegramBot:
 
     async def start_polling(self) -> None:
         if not self.token:
-            log_error("TELEGRAM_BOT_TOKEN environment variable is not configured.")
-            print("\n[ERROR] TELEGRAM_BOT_TOKEN is missing!")
-            print("Set your bot token before running:")
-            print("  export TELEGRAM_BOT_TOKEN='your_bot_token_from_botfather'")
+            log_error("TELEGRAM_BOT_TOKEN is not configured. Switching to Terminal CLI mode.")
+            await run_terminal_cli()
             return
 
         self.is_running = True
@@ -1567,7 +1713,7 @@ class TelegramBot:
 
 
 # ------------------------------------------------------------------------------
-# 7. Self-Verification Health Check & Entry Point
+# 8. Self-Verification Health Check & Entry Point
 # ------------------------------------------------------------------------------
 
 async def run_health_check() -> bool:
@@ -1596,10 +1742,24 @@ async def run_health_check() -> bool:
 async def main() -> None:
     try:
         await run_health_check()
-        bot = TelegramBot(Config.get_bot_token())
-        await bot.start_polling()
+        
+        # Check if terminal CLI mode is explicitly requested or bot token is empty
+        run_cli_mode = (
+            "--cli" in sys.argv or
+            "--terminal" in sys.argv or
+            os.getenv("IVA_MODE") == "terminal" or
+            not Config.get_bot_token()
+        )
+
+        if run_cli_mode:
+            print("\n💻 اجرای مستقیم در حالت ترمینال (Terminal CLI Mode)...")
+            await run_terminal_cli()
+        else:
+            bot = TelegramBot(Config.get_bot_token())
+            await bot.start_polling()
+
     except Exception as ex:
-        log_error(f"Fatal error during bot execution: {ex}\n{traceback.format_exc()}")
+        log_error(f"Fatal error during execution: {ex}\n{traceback.format_exc()}")
         raise
 
 
@@ -1607,4 +1767,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nBot stopped by user.")
+        print("\nبرنامه با درخواست کاربر متوقف شد.")
