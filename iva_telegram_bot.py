@@ -9,6 +9,7 @@ Compatible with:
   - Python 3.10, 3.11, 3.12, 3.13, 3.14+
   - Zero mandatory external dependencies (pure standard library + optional cryptography/aiohttp)
   - Dual Mode: Interactive Terminal CLI & Async Telegram Bot
+  - Direct Domestic Routing for Sadad + Proxy Routing for Telegram
 ================================================================================
 """
 
@@ -842,6 +843,8 @@ class IvaAuthClient:
         self.current_phone = phone
         self.repo = repository or FileSessionRepository()
         self.session = SessionData(phone=phone)
+        self._last_otp_token: str = ""
+        self._last_reagent: str = "0"
         iva_proxy = os.getenv("IVA_PROXY", "").strip() or None
         self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT, proxy=iva_proxy)
 
@@ -891,7 +894,7 @@ class IvaAuthClient:
         headers["Content-Type"] = "application/json"
 
         status, text = await self.http.request("POST", url, headers, json_body)
-        log_debug(f"POST {path} -> HTTP {status}")
+        log_debug(f"POST {path} -> HTTP {status} Body: {text[:150]}")
 
         try:
             doc = json.loads(text) if text.strip() else {}
@@ -941,16 +944,23 @@ class IvaAuthClient:
     # --- 1. Request OTP ---
     async def request_otp(self, phone_number: str) -> Dict[str, Any]:
         self.current_phone = phone_number
-        data = await self._post_json("/v1/users/auth/verifyCode", {"PhoneNumber": phone_number})
+        payload = {"PhoneNumber": phone_number}
+        data = await self._post_json("/v1/users/auth/verifyCode", payload)
+        if isinstance(data, dict):
+            self._last_otp_token = str(data.get("Token") or data.get("token") or "")
+            self._last_reagent = str(data.get("ReagentNumber") or data.get("reagentNumber") or "0")
         return data
 
     # --- 2. Verify OTP Code ---
-    async def verify_code(self, verification_code: str, token: str, reagent_number: str = "0") -> Dict[str, Any]:
-        data = await self._post_json("/v1/users/auth/token", {
-            "VerificationCode": verification_code,
-            "Token": token,
-            "ReagentNumber": reagent_number
-        })
+    async def verify_code(self, verification_code: str, token: Optional[str] = None, reagent_number: Optional[str] = None) -> Dict[str, Any]:
+        tok = (token or self._last_otp_token or "").strip()
+        reagent = (reagent_number or self._last_reagent or "0").strip()
+        payload = {
+            "VerificationCode": verification_code.strip(),
+            "Token": tok,
+            "ReagentNumber": reagent
+        }
+        data = await self._post_json("/v1/users/auth/token", payload)
         self._persist_tokens(data)
         await self.save_session()
         return data
@@ -971,16 +981,22 @@ class IvaAuthClient:
             await self.key_exchange()
 
     def _persist_tokens(self, data: Dict[str, Any]) -> None:
-        if data.get("accessToken"):
-            self.session.token = data["accessToken"]
-        if data.get("refreshToken"):
-            self.session.refreshToken = data["refreshToken"]
-        if data.get("expiresIn"):
-            self.session.expiresIn = int(data["expiresIn"])
+        if not isinstance(data, dict):
+            return
+        access_tok = data.get("accessToken") or data.get("AccessToken") or data.get("token") or data.get("Token")
+        if access_tok:
+            self.session.token = str(access_tok)
+        refresh_tok = data.get("refreshToken") or data.get("RefreshToken")
+        if refresh_tok:
+            self.session.refreshToken = str(refresh_tok)
+        exp_in = data.get("expiresIn") or data.get("ExpiresIn")
+        if exp_in:
+            self.session.expiresIn = int(exp_in)
         self.session.accessTokenObtainedAt = int(time.time())
-        if data.get("key"):
+        key = data.get("key") or data.get("Key")
+        if key:
             try:
-                self.session.rsaPublic = IvaCrypto.base64_modulus_to_pem(data["key"])
+                self.session.rsaPublic = IvaCrypto.base64_modulus_to_pem(str(key))
             except Exception as ex:
                 log_debug(f"Modulus wrap note: {ex}")
 
@@ -1172,13 +1188,14 @@ async def run_terminal_cli() -> None:
             print("⏳ در حال ارسال شماره به سرور ایوا جهت دریافت کد پیامکی...")
             try:
                 res = await client.request_otp(phone)
-                req_token = res.get("Token", "")
+                req_token = res.get("Token") or res.get("token") or client._last_otp_token or ""
+                reagent = res.get("ReagentNumber") or res.get("reagentNumber") or client._last_reagent or "0"
                 print(f"✅ پیامک حاوی کد با موفقیت به شماره {phone} ارسال گردید.")
 
                 otp_code = await loop.run_in_executor(None, ask, "📩 کد ۵ رقمی پیامک‌شده را وارد نمایید: ")
                 print("⏳ در حال اعتبارسنجی کد در سرور سداد...")
                 client.current_phone = phone
-                token_res = await client.verify_code(otp_code, req_token)
+                token_res = await client.verify_code(otp_code, token=req_token, reagent_number=reagent)
 
                 print("⏳ در حال تبادل کلیدهای امنیتی AES...")
                 try:
@@ -1188,7 +1205,9 @@ async def run_terminal_cli() -> None:
                     print(f"⚠️ توجه در تبادل کلید: {k_ex}")
 
                 print("\n🎉 احراز هویت با موفقیت کامل انجام شد و سشن ذخیره گردید!")
-                print(f"⏱ مدت زمان اعتبار توکن: {token_res.get('expiresIn', 0)} ثانیه")
+                exp_seconds = token_res.get('expiresIn') or token_res.get('ExpiresIn') or 0
+                print(f"⏱ مدت زمان اعتبار توکن: {exp_seconds} ثانیه")
+                print("💡 اکنون این حساب به صورت خودکار در ربات تلگرام نیز فعال است.")
             except Exception as ex:
                 print(f"\n❌ خطا در فرآیند احراز هویت: {ex}")
 
@@ -1275,6 +1294,7 @@ class TelegramBot:
     def __init__(self, token: Optional[str] = None):
         self.token = (token or Config.get_bot_token()).strip()
         self.api_url = f"https://api.telegram.org/bot{self.token}"
+        # Telegram proxy configuration (local HTTP/SOCKS proxy)
         telegram_proxy = os.getenv("TELEGRAM_PROXY", "").strip() or None
         self.http = AsyncHttpClient(timeout=35.0, proxy=telegram_proxy)
         self.repo = FileSessionRepository()
@@ -1349,6 +1369,21 @@ class TelegramBot:
 
     async def get_client(self, user_id: int) -> IvaAuthClient:
         phone = user_active_phone.get(user_id)
+        if not phone:
+            user_phones = await self.repo.list_phones(user_id)
+            if user_phones:
+                phone = user_phones[0]
+                user_active_phone[user_id] = phone
+            else:
+                # Inherit terminal session (1001) if available
+                term_phones = await self.repo.list_phones(1001)
+                if term_phones:
+                    phone = term_phones[0]
+                    user_active_phone[user_id] = phone
+                    term_sess = await self.repo.load(1001, phone)
+                    if term_sess:
+                        await self.repo.save(user_id, term_sess)
+
         client = IvaAuthClient(telegram_user_id=user_id, phone=phone, repository=self.repo)
         if phone:
             await client.load_session(phone)
@@ -1421,7 +1456,8 @@ class TelegramBot:
                 user_states[user_id] = {
                     "step": "auth_otp",
                     "phone": phone,
-                    "token": res.get("Token"),
+                    "token": res.get("Token") or res.get("token") or client._last_otp_token,
+                    "reagent": res.get("ReagentNumber") or res.get("reagentNumber") or client._last_reagent,
                 }
                 user_active_phone[user_id] = phone
                 await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{clean_html(phone)}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
@@ -1433,12 +1469,13 @@ class TelegramBot:
             otp_code = text.strip()
             phone = state.get("phone", "")
             req_token = state.get("token", "")
+            reagent = state.get("reagent", "0")
             client = await self.get_client(user_id)
             client.current_phone = phone
 
             await self.send_message(chat_id, "⏳ در حال اعتبارسنجی کد...")
             try:
-                token_res = await client.verify_code(otp_code, req_token)
+                token_res = await client.verify_code(otp_code, token=req_token, reagent_number=reagent)
                 user_states[user_id] = {}
                 user_active_phone[user_id] = phone
 
@@ -1694,7 +1731,7 @@ class TelegramBot:
             bot_user = me_res.get("result", {})
             log_info(f"Connected to Telegram API as @{bot_user.get('username')} (ID: {bot_user.get('id')})")
         else:
-            log_error(f"Telegram getMe check failed: {me_res.get('description')}")
+            log_error(f"Telegram getMe check: {me_res.get('description')}")
 
         offset = 0
         while self.is_running:
