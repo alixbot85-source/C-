@@ -20,9 +20,11 @@ import ctypes.util
 from dataclasses import dataclass, asdict
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 import sys
@@ -98,11 +100,15 @@ def mask_sensitive(text: str) -> str:
         return text
     s = str(text)
     # Mask 16-digit card numbers (keep first 6 and last 4)
-    import re
     s = re.sub(r'\b(\d{6})\d{6}(\d{4})\b', r'\1******\2', s)
     # Mask Bearer tokens
     s = re.sub(r'Bearer\s+[A-Za-z0-9_\-\.]{20,}', 'Bearer [MASKED_TOKEN]', s)
     return s
+
+
+def clean_html(text: Any) -> str:
+    """Safely escapes HTML special characters for Telegram messages."""
+    return html.escape(str(text)) if text is not None else ""
 
 
 def log_debug(msg: str) -> None:
@@ -130,7 +136,6 @@ def log_error(msg: str) -> None:
 # 2. Cryptographic Engine (AES-256-CBC, RSA-2048, HMAC-SHA256)
 # ------------------------------------------------------------------------------
 
-# --- Pure Python AES-256 Tables & Routines ---
 _AES_SBOX = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -733,7 +738,17 @@ class AsyncHttpClient:
             resp_text = ex.read().decode("utf-8", errors="replace")
             return status, resp_text
         except Exception as ex:
-            raise IvaApiException(f"خطای ارتباط شبکه: {ex}")
+            err_msg = str(ex)
+            if "timed out" in err_msg or "Timeout" in err_msg:
+                raise IvaApiException("مهلت اتصال به سرور ایوا به پایان رسید (Connection Timeout). لطفاً اینترنت خود را بررسی کنید.")
+            elif "Name or service not known" in err_msg or "getaddrinfo failed" in err_msg:
+                raise IvaApiException("عدم دسترسی به سرور ایوا (DNS Error). در صورت فعال بودن فیلترشکن، ممکن است سرورهای ایرانی محدود شده باشند.")
+            elif "Connection refused" in err_msg:
+                raise IvaApiException("اتصال به سرور ایوا برقرار نشد (Connection Refused).")
+            elif "SSL" in err_msg or "CERTIFICATE" in err_msg:
+                raise IvaApiException(f"خطای امنیتی گواهی SSL: {err_msg}")
+            else:
+                raise IvaApiException(f"خطای شبکه: {err_msg}")
 
 
 class IvaAuthClient:
@@ -803,7 +818,7 @@ class IvaAuthClient:
         try:
             doc = json.loads(text) if text.strip() else {}
         except Exception:
-            raise IvaApiException(f"پاسخ نامعتبر سرور (HTTP {status}): {text}", str(status))
+            raise IvaApiException(f"پاسخ نامعتبر سرور (HTTP {status}): {clean_html(text[:150])}", str(status))
 
         err = doc.get("error")
         if err and str(err.get("code")) not in ("200", "None", ""):
@@ -834,7 +849,7 @@ class IvaAuthClient:
         try:
             doc = json.loads(text) if text.strip() else {}
         except Exception:
-            raise IvaApiException(f"پاسخ نامعتبر سرور (HTTP {status}): {text}", str(status))
+            raise IvaApiException(f"پاسخ نامعتبر سرور (HTTP {status}): {clean_html(text[:150])}", str(status))
 
         err = doc.get("error")
         if err and str(err.get("code")) not in ("200", "None", ""):
@@ -1049,11 +1064,21 @@ class TelegramBot:
             log_error(f"Telegram Request Exception ({method}): {ex}")
             return {"ok": False, "description": str(ex)}
 
-    async def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    async def send_message(self, chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None, parse_mode: Optional[str] = "HTML") -> None:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        await self.call_api("sendMessage", payload)
+
+        res = await self.call_api("sendMessage", payload)
+        if not res.get("ok"):
+            err_desc = res.get("description", "")
+            # If HTML parsing fails on Telegram side, retry automatically as plain text
+            if "can't parse entities" in err_desc or "entity" in err_desc.lower():
+                log_debug(f"Retrying sendMessage without parse_mode due to entity issue: {err_desc}")
+                payload.pop("parse_mode", None)
+                await self.call_api("sendMessage", payload)
 
     async def answer_callback(self, callback_id: str, text: Optional[str] = None) -> None:
         payload = {"callback_query_id": callback_id}
@@ -1127,7 +1152,7 @@ class TelegramBot:
             welcome = (
                 "🏦 <b>پنل مدیریت و تست سامانه IVA / Sadad</b>\n\n"
                 f"وضعیت اتصال: <b>{'🟢 متصل' if is_connected else '⚪ متصل نیست'}</b>\n"
-                f"حساب فعال: <code>{phone or 'تعیین نشده'}</code>\n"
+                f"حساب فعال: <code>{clean_html(phone or 'تعیین نشده')}</code>\n"
                 f"نسخه کلاینت: <code>{Config.APP_VERSION}</code>\n\n"
                 "جهت مدیریت حساب یا اجرای عملیات یکی از گزینه‌های زیر را انتخاب نمایید:"
             )
@@ -1170,9 +1195,9 @@ class TelegramBot:
                     "token": res.get("Token"),
                 }
                 user_active_phone[user_id] = phone
-                await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{phone}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
+                await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{clean_html(phone)}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در درخواست OTP: {ex}")
+                await self.send_message(chat_id, f"❌ خطا در درخواست OTP:\n<code>{clean_html(ex)}</code>")
             return
 
         if step == "auth_otp":
@@ -1192,18 +1217,18 @@ class TelegramBot:
                     await client.key_exchange()
                     key_msg = "✅ تبادل کلیدهای امنیتی AES نیز با موفقیت انجام شد."
                 except Exception as k_ex:
-                    key_msg = f"⚠️ هشدار در تبادل کلید: {k_ex}"
+                    key_msg = f"⚠️ هشدار در تبادل کلید: {clean_html(k_ex)}"
 
                 msg_success = (
                     "🎉 <b>احراز هویت با موفقیت انجام شد!</b>\n\n"
-                    f"📱 شماره: <code>{phone}</code>\n"
+                    f"📱 شماره: <code>{clean_html(phone)}</code>\n"
                     f"⏱ مدت اعتبار توکن: <code>{token_res.get('expiresIn', 0)} ثانیه</code>\n"
                     f"{key_msg}\n\n"
                     "اکنون می‌توانید از تمام امکانات سامانه استفاده نمایید."
                 )
                 await self.send_message(chat_id, msg_success, self.get_main_menu(True, phone, user_id))
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطا در تأیید کد: {ex}\nلطفاً مجدداً کد را ارسال نمایید:")
+                await self.send_message(chat_id, f"❌ خطا در تأیید کد:\n<code>{clean_html(ex)}</code>\nلطفاً مجدداً کد را ارسال نمایید:")
             return
 
         # Default fallback
@@ -1233,14 +1258,14 @@ class TelegramBot:
                 profile = await client.get_profile()
                 prof_text = (
                     "👤 <b>اطلاعات پروفایل کاربری:</b>\n\n"
-                    f"نام و نام‌خانوادگی: <code>{profile.get('firstName', '')} {profile.get('lastName', '')}</code>\n"
-                    f"کد ملی: <code>{profile.get('nationalCode', '---')}</code>\n"
-                    f"شماره همراه: <code>{profile.get('cellPhoneNumber', client.current_phone)}</code>\n"
-                    f"شناسه کاربر: <code>{profile.get('userId', '---')}</code>"
+                    f"نام و نام‌خانوادگی: <code>{clean_html(profile.get('firstName', ''))} {clean_html(profile.get('lastName', ''))}</code>\n"
+                    f"کد ملی: <code>{clean_html(profile.get('nationalCode', '---'))}</code>\n"
+                    f"شماره همراه: <code>{clean_html(profile.get('cellPhoneNumber', client.current_phone))}</code>\n"
+                    f"شناسه کاربر: <code>{clean_html(profile.get('userId', '---'))}</code>"
                 )
                 await self.send_message(chat_id, prof_text)
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای دریافت اطلاعات: {ex}")
+                await self.send_message(chat_id, f"❌ خطای دریافت اطلاعات:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "menu_refresh":
@@ -1252,7 +1277,7 @@ class TelegramBot:
                 res = await client.refresh_token()
                 await self.send_message(chat_id, f"✅ توکن با موفقیت تمدید شد!\nمدت اعتبار: <code>{res.get('expiresIn', 0)} ثانیه</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تمدید توکن: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تمدید توکن:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "menu_keyexchange":
@@ -1261,7 +1286,7 @@ class TelegramBot:
                 await client.key_exchange()
                 await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود و کانال ارتباطی امن شد.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تبادل کلید: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تبادل کلید:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "menu_configs":
@@ -1281,7 +1306,7 @@ class TelegramBot:
                 catalog = await client.get_charge_catalog()
                 await self.send_message(chat_id, f"📦 کاتالوگ بسته‌های شارژ دریافت شد.\nتعداد موارد: <code>{len(catalog)}</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ: {ex}")
+                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "menu_status":
@@ -1291,7 +1316,7 @@ class TelegramBot:
             has_rsa = bool(client.session.rsaPublic)
             status_msg = (
                 "📊 <b>وضعیت نشست جاری:</b>\n\n"
-                f"شماره فعال: <code>{client.current_phone or 'نامشخص'}</code>\n"
+                f"شماره فعال: <code>{clean_html(client.current_phone or 'نامشخص')}</code>\n"
                 f"وضعیت توکن: <b>{'❌ منقضی یا ناموجود' if is_token_exp else '🟢 معتبر'}</b>\n"
                 f"کلید AES متقارن (DataKey): <b>{'✅ آماده' if has_shared else '❌ ناموجود'}</b>\n"
                 f"کلید امضا HMAC (MacKey): <b>{'✅ آماده' if has_working else '❌ ناموجود'}</b>\n"
@@ -1321,7 +1346,7 @@ class TelegramBot:
         if data.startswith("acc_select_"):
             target_phone = data.replace("acc_select_", "")
             user_active_phone[user_id] = target_phone
-            await self.send_message(chat_id, f"✅ حساب فعال به شماره <code>{target_phone}</code> تغییر یافت.")
+            await self.send_message(chat_id, f"✅ حساب فعال به شماره <code>{clean_html(target_phone)}</code> تغییر یافت.")
             return
 
         if data == "acc_delete_current":
@@ -1345,17 +1370,17 @@ class TelegramBot:
         if data == "test_me":
             try:
                 res = await client.get_profile()
-                await self.send_message(chat_id, f"✅ خروجی موفق <code>/v1/users/me</code>:\n<code>{json.dumps(res, ensure_ascii=False)[:300]}</code>")
+                await self.send_message(chat_id, f"✅ خروجی موفق <code>/v1/users/me</code>:\n<code>{clean_html(json.dumps(res, ensure_ascii=False)[:300])}</code>")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /users/me: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تست /users/me:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "test_configs":
             try:
                 await client.try_discover_public_key()
-                await self.send_message(chat_id, f"✅ خروجی موفق <code>/v1/baseInfo/configs/list</code>.\nکلید RSA سرور ثبت شد.")
+                await self.send_message(chat_id, "✅ خروجی موفق <code>/v1/baseInfo/configs/list</code>.\nکلید RSA سرور ثبت شد.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /configs/list: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تست /configs/list:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "test_catalog":
@@ -1363,7 +1388,7 @@ class TelegramBot:
                 res = await client.get_charge_catalog()
                 await self.send_message(chat_id, f"✅ خروجی موفق <code>/v3/charges/pin/mobile/catalog</code>:\nتعداد اپراتورها: {len(res)}")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای تست /catalog: {ex}")
+                await self.send_message(chat_id, f"❌ خطای تست /catalog:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "test_keyex":
@@ -1371,7 +1396,7 @@ class TelegramBot:
                 await client.key_exchange()
                 await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود.")
             except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای Key Exchange: {ex}")
+                await self.send_message(chat_id, f"❌ خطای Key Exchange:\n<code>{clean_html(ex)}</code>")
             return
 
         if data == "menu_help":
@@ -1391,14 +1416,14 @@ class TelegramBot:
                 f"👥 کاربران شناسایی‌شده: <code>{len(known_users)}</code>\n"
                 f"📁 پوشه‌های نشست ثبت‌شده: <code>{len(all_users)}</code>\n"
                 f"🐍 نسخه پایتون: <code>{sys.version.split()[0]}</code>\n"
-                f"📂 مسیر نشست‌ها: <code>{Config.SESSION_DIR}</code>"
+                f"📂 مسیر نشست‌ها: <code>{clean_html(Config.SESSION_DIR)}</code>"
             )
             await self.send_message(chat_id, status_text)
             return
 
         if data == "admin_logs" and self.is_admin(user_id):
             logs = "\n".join(in_memory_logs[-20:]) or "هیچ لاگی موجود نیست."
-            await self.send_message(chat_id, f"📋 <b>گزارش لاگ‌های سیستمی:</b>\n\n<pre>{logs}</pre>")
+            await self.send_message(chat_id, f"📋 <b>گزارش لاگ‌های سیستمی:</b>\n\n<pre>{clean_html(logs)}</pre>")
             return
 
         if data == "menu_start":
