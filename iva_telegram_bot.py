@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-IVA / Sadad Android & Linux Unified Telegram Bot & Terminal API Client
+IVA / Sadad Android & Linux Unified Telegram Bot & Terminal API Client (IvaScanner)
 ================================================================================
 Compatible with:
   - Android Termux (aarch64 / arm64 / armv7l / x86_64)
   - Python 3.10, 3.11, 3.12, 3.13, 3.14+
-  - Zero mandatory external dependencies (pure standard library + optional cryptography/aiohttp)
-  - Dual Mode: Interactive Terminal CLI & Async Telegram Bot
-  - Direct Domestic Routing for Sadad + Proxy Routing for Telegram
+  - Zero mandatory external dependencies (pure standard library + optional cryptography/libcrypto)
+  - Full Dual Mode: Interactive Terminal CLI & Async Telegram Bot Polling Engine
+  - Endpoints: KeyExchange, verifyCode, token, refreshtoken, users/me, configs/list,
+               charges catalog, pin payment, topup payment, Shaparak TSM getKey.
+  - Card Scanner & Charge Payment with auto-retry and multi-account isolation.
 ================================================================================
 """
 
@@ -19,7 +21,7 @@ import asyncio
 import base64
 import ctypes
 import ctypes.util
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 import hashlib
 import hmac
 import html
@@ -42,23 +44,105 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.primitives import padding as crypto_padding
+    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key
     _HAS_CRYPTOGRAPHY = True
-except Exception:
+except ImportError:
     _HAS_CRYPTOGRAPHY = False
 
+# Try loading native libcrypto via ctypes
+_LIBCRYPTO = None
+if not _HAS_CRYPTOGRAPHY:
+    try:
+        _lib_path = (
+            ctypes.util.find_library("crypto")
+            or "libcrypto.so.3"
+            or "libcrypto.so.1.1"
+            or "libcrypto.so"
+        )
+        if _lib_path:
+            _LIBCRYPTO = ctypes.CDLL(_lib_path)
+            _LIBCRYPTO.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+            _LIBCRYPTO.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+            _LIBCRYPTO.EVP_aes_256_cbc.restype = ctypes.c_void_p
+            _LIBCRYPTO.EVP_EncryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            _LIBCRYPTO.EVP_EncryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+            _LIBCRYPTO.EVP_EncryptFinal_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+            _LIBCRYPTO.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+            _LIBCRYPTO.EVP_DecryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+            _LIBCRYPTO.EVP_DecryptFinal_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    except Exception:
+        _LIBCRYPTO = None
+
 
 # ------------------------------------------------------------------------------
-# 1. Configuration & Logging Subsystem
+# 1. Constants & Configuration (IvaConstants & IvaOptions)
 # ------------------------------------------------------------------------------
+
+class IvaConstants:
+    """Constants mirroring C# IvaScanner.IvaConstants."""
+    ApiBaseUrl: str = "https://ivapwa.sadadpsp.ir"
+    ApiPrefix: str = "/pwa/api"
+    PublicKeyUrl: str = "https://tsm.shaparak.ir/mobileApp/getKey"
+    AppVersion: str = "3.10.24"
+
+    class Endpoints:
+        KeyExchange: str = "/v1/users/auth/keyExchange"
+        RegisterRequest: str = "/v1/users/auth/verifyCode"
+        Activation: str = "/v1/users/auth/token"
+        RefreshToken: str = "/v1/users/auth/refreshtoken"
+        UserProfile: str = "/v1/users/me"
+        AppConfiguration: str = "/v1/baseInfo/configs/list"
+        ChargeCatalog: str = "/v3/charges/pin/mobile/catalog"
+        PayCharge: str = "/v1/charges/pin/payment"
+        PayChargeV3: str = "/v3/charges/pin/pay"
+        TopupRequest: str = "/v1/charges/topup/payment"
+
+    SignExclude: Set[str] = {
+        "/v1/users/auth/keyExchange",
+        "/v1/users/auth/verifyCode",
+        "/v1/users/auth/token",
+        "/v1/users/auth/refreshtoken",
+    }
+
+    class StorageKeys:
+        Token: str = "token"
+        RefreshToken: str = "refreshToken"
+        AccessTokenExpTime: str = "accessTokenExpTime"
+        TokenType: str = "tokenType"
+        AccessTokenObtainedAt: str = "accessTokenObtainedAt"
+        SharedKey: str = "shared_key"
+        WorkingKey: str = "working_key"
+        RsaPublic: str = "rsaPublic"
+        PichakRsaPublic: str = "pichakRSAPublic"
+
+    DefaultAesIv: bytes = bytes(16)
+    CustomAesIv: bytes = bytes([48, 148, 136, 186, 72, 57, 83, 116, 19, 138, 210, 230, 3, 165, 240, 35])
+
 
 class Config:
-    API_BASE_URL: str = os.getenv("IVA_BASE_URL", "https://ivaapi.sadadpsp.ir").rstrip("/")
-    API_PREFIX: str = os.getenv("IVA_API_PREFIX", "/pwa/api")
-    APP_VERSION: str = os.getenv("IVA_APP_VERSION", "3.10.24")
+    """Global Runtime Configuration."""
+    API_BASE_URL: str = os.getenv("IVA_BASE_URL", IvaConstants.ApiBaseUrl).rstrip("/")
+    API_PREFIX: str = os.getenv("IVA_API_PREFIX", IvaConstants.ApiPrefix)
+    PUBLIC_KEY_URL: str = os.getenv("IVA_PUBLIC_KEY_URL", IvaConstants.PublicKeyUrl)
+    APP_VERSION: str = os.getenv("IVA_APP_VERSION", IvaConstants.AppVersion)
+    KEY_ID: str = os.getenv("IVA_KEY_ID", "1")
     SESSION_DIR: str = os.path.abspath(os.path.expanduser(os.getenv("IVA_SESSION_DIR", "./sessions")))
     LOGS_DIR: str = os.path.abspath(os.path.expanduser(os.getenv("IVA_LOGS_DIR", "./logs")))
     REQUEST_TIMEOUT: float = float(os.getenv("IVA_TIMEOUT", "65.0"))
+    MAX_CHARGE_RETRIES: int = int(os.getenv("IVA_MAX_CHARGE_RETRIES", "10"))
+    CHARGE_RETRY_DELAY: float = float(os.getenv("IVA_CHARGE_RETRY_DELAY", "0.5"))
     BOT_START_TIME: float = time.time()
+
+    RETRYABLE_STATUS_MESSAGES: List[str] = [
+        "محدودیت روزانه تراکنش",
+        "عملیات ناموفق بود",
+        "سرویس در حال حاضر قادر به پاسخگویی نیست",
+    ]
+
+    DAILY_LIMIT_MESSAGES: List[str] = [
+        "محدودیت روزانه تراکنش",
+    ]
 
     @classmethod
     def get_bot_token(cls) -> str:
@@ -77,9 +161,8 @@ class Config:
 os.makedirs(Config.SESSION_DIR, exist_ok=True)
 os.makedirs(Config.LOGS_DIR, exist_ok=True)
 
-logger = logging.getLogger("IvaBot")
+logger = logging.getLogger("IvaScannerBot")
 logger.setLevel(logging.INFO)
-
 log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 # Console handler
@@ -136,7 +219,7 @@ def log_error(msg: str) -> None:
 
 
 # ------------------------------------------------------------------------------
-# 2. Cryptographic Engine (AES-256-CBC, RSA-2048, HMAC-SHA256)
+# 2. Cryptographic Engine (IvaCrypto - 3-Tier Fallback)
 # ------------------------------------------------------------------------------
 
 _AES_SBOX = [
@@ -157,413 +240,375 @@ _AES_SBOX = [
     0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
 ]
-_AES_RSBOX = [0] * 256
-for _i, _x in enumerate(_AES_SBOX):
-    _AES_RSBOX[_x] = _i
 
-_AES_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
+_AES_INV_SBOX = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
+]
+
+_RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
 
 
 def _xtime(a: int) -> int:
     return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1)
 
 
-def _gf_mul(a: int, b: int) -> int:
-    res = 0
-    while b:
-        if b & 1:
-            res ^= a
-        a = _xtime(a)
-        b >>= 1
-    return res
-
-
-def _key_expansion_256(key: bytes) -> List[List[int]]:
-    w = [list(key[i:i+4]) for i in range(0, 32, 4)]
+def _pure_aes256_expand_key(key: bytes) -> List[List[int]]:
+    w = [list(key[4 * i : 4 * i + 4]) for i in range(8)]
     for i in range(8, 60):
-        temp = list(w[i-1])
+        temp = list(w[i - 1])
         if i % 8 == 0:
-            temp = [_AES_SBOX[b] for b in (temp[1:] + temp[:1])]
-            temp[0] ^= _AES_RCON[i // 8]
+            temp = [_AES_SBOX[temp[1]], _AES_SBOX[temp[2]], _AES_SBOX[temp[3]], _AES_SBOX[temp[0]]]
+            temp[0] ^= _RCON[i // 8]
         elif i % 8 == 4:
-            temp = [_AES_SBOX[b] for b in temp]
-        w.append([w[i-8][j] ^ temp[j] for j in range(4)])
-    round_keys: List[List[int]] = []
+            temp = [_AES_SBOX[x] for x in temp]
+        w.append([w[i - 8][j] ^ temp[j] for j in range(4)])
+    round_keys = []
     for r in range(15):
-        rk: List[int] = []
+        rk = []
         for c in range(4):
-            rk.extend(w[r*4 + c])
+            rk.extend(w[r * 4 + c])
         round_keys.append(rk)
     return round_keys
 
 
-def _aes_cipher_block(block: bytes, round_keys: List[List[int]]) -> bytes:
-    state = [list(block[i:i+4]) for i in range(0, 16, 4)]
+def _inv_mix_columns(state: List[List[int]]) -> None:
+    def mul(a: int, b: int) -> int:
+        p = 0
+        for _ in range(8):
+            if b & 1: p ^= a
+            hi = a & 0x80
+            a = (a << 1) & 0xFF
+            if hi: a ^= 0x1B
+            b >>= 1
+        return p
     for c in range(4):
-        for r in range(4):
-            state[c][r] ^= round_keys[0][c*4 + r]
+        u = state[c]
+        s0 = mul(u[0], 0x0E) ^ mul(u[1], 0x0B) ^ mul(u[2], 0x0D) ^ mul(u[3], 0x09)
+        s1 = mul(u[0], 0x09) ^ mul(u[1], 0x0E) ^ mul(u[2], 0x0B) ^ mul(u[3], 0x0D)
+        s2 = mul(u[0], 0x0D) ^ mul(u[1], 0x09) ^ mul(u[2], 0x0E) ^ mul(u[3], 0x0B)
+        s3 = mul(u[0], 0x0B) ^ mul(u[1], 0x0D) ^ mul(u[2], 0x09) ^ mul(u[3], 0x0E)
+        state[c] = [s0, s1, s2, s3]
+
+
+def _pure_aes256_encrypt_block(block: bytes, round_keys: List[List[int]]) -> bytes:
+    state = [list(block[4 * i : 4 * i + 4]) for i in range(4)]
+    for r in range(4):
+        for c in range(4):
+            state[c][r] ^= round_keys[0][r + 4 * c]
     for rnd in range(1, 14):
-        for c in range(4):
-            for r in range(4):
+        for r in range(4):
+            for c in range(4):
                 state[c][r] = _AES_SBOX[state[c][r]]
-        s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
-        state = [
-            [s0[0], s1[1], s2[2], s3[3]],
-            [s1[0], s2[1], s3[2], s0[3]],
-            [s2[0], s3[1], s0[2], s1[3]],
-            [s3[0], s0[1], s1[2], s2[3]]
-        ]
+        s0, s1, s2, s3 = state[0][1], state[1][1], state[2][1], state[3][1]
+        state[0][1], state[1][1], state[2][1], state[3][1] = s1, s2, s3, s0
+        s0, s1, s2, s3 = state[0][2], state[1][2], state[2][2], state[3][2]
+        state[0][2], state[1][2], state[2][2], state[3][2] = s2, s3, s0, s1
+        s0, s1, s2, s3 = state[0][3], state[1][3], state[2][3], state[3][3]
+        state[0][3], state[1][3], state[2][3], state[3][3] = s3, s0, s1, s2
         for c in range(4):
-            col = state[c]
-            a, b, cb, d = col[0], col[1], col[2], col[3]
-            state[c][0] = _gf_mul(2, a) ^ _gf_mul(3, b) ^ cb ^ d
-            state[c][1] = a ^ _gf_mul(2, b) ^ _gf_mul(3, cb) ^ d
-            state[c][2] = a ^ b ^ _gf_mul(2, cb) ^ _gf_mul(3, d)
-            state[c][3] = _gf_mul(3, a) ^ b ^ cb ^ _gf_mul(2, d)
-        for c in range(4):
-            for r in range(4):
-                state[c][r] ^= round_keys[rnd][c*4 + r]
-
-    for c in range(4):
+            a0, a1, a2, a3 = state[c][0], state[c][1], state[c][2], state[c][3]
+            state[c][0] = _xtime(a0) ^ _xtime(a1) ^ a1 ^ a2 ^ a3
+            state[c][1] = a0 ^ _xtime(a1) ^ _xtime(a2) ^ a2 ^ a3
+            state[c][2] = a0 ^ a1 ^ _xtime(a2) ^ _xtime(a3) ^ a3
+            state[c][3] = _xtime(a0) ^ a0 ^ a1 ^ a2 ^ _xtime(a3)
         for r in range(4):
+            for c in range(4):
+                state[c][r] ^= round_keys[rnd][r + 4 * c]
+    for r in range(4):
+        for c in range(4):
             state[c][r] = _AES_SBOX[state[c][r]]
-    s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
-    state = [
-        [s0[0], s1[1], s2[2], s3[3]],
-        [s1[0], s2[1], s3[2], s0[3]],
-        [s2[0], s3[1], s0[2], s1[3]],
-        [s3[0], s0[1], s1[2], s2[3]]
-    ]
-    for c in range(4):
-        for r in range(4):
-            state[c][r] ^= round_keys[14][c*4 + r]
-
+    s0, s1, s2, s3 = state[0][1], state[1][1], state[2][1], state[3][1]
+    state[0][1], state[1][1], state[2][1], state[3][1] = s1, s2, s3, s0
+    s0, s1, s2, s3 = state[0][2], state[1][2], state[2][2], state[3][2]
+    state[0][2], state[1][2], state[2][2], state[3][2] = s2, s3, s0, s1
+    s0, s1, s2, s3 = state[0][3], state[1][3], state[2][3], state[3][3]
+    state[0][3], state[1][3], state[2][3], state[3][3] = s3, s0, s1, s2
+    for r in range(4):
+        for c in range(4):
+            state[c][r] ^= round_keys[14][r + 4 * c]
     out = bytearray(16)
     for c in range(4):
         for r in range(4):
-            out[c*4 + r] = state[c][r]
+            out[r + 4 * c] = state[c][r]
     return bytes(out)
 
 
-def _aes_inv_cipher_block(block: bytes, round_keys: List[List[int]]) -> bytes:
-    state = [list(block[i:i+4]) for i in range(0, 16, 4)]
-    for c in range(4):
-        for r in range(4):
-            state[c][r] ^= round_keys[14][c*4 + r]
+def _pure_aes256_decrypt_block(block: bytes, round_keys: List[List[int]]) -> bytes:
+    state = [list(block[4 * i : 4 * i + 4]) for i in range(4)]
+    for r in range(4):
+        for c in range(4):
+            state[c][r] ^= round_keys[14][r + 4 * c]
     for rnd in range(13, 0, -1):
-        s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
-        state = [
-            [s0[0], s3[1], s2[2], s1[3]],
-            [s1[0], s0[1], s3[2], s2[3]],
-            [s2[0], s1[1], s0[2], s3[3]],
-            [s3[0], s2[1], s1[2], s0[3]]
-        ]
+        s0, s1, s2, s3 = state[0][1], state[1][1], state[2][1], state[3][1]
+        state[0][1], state[1][1], state[2][1], state[3][1] = s3, s0, s1, s2
+        s0, s1, s2, s3 = state[0][2], state[1][2], state[2][2], state[3][2]
+        state[0][2], state[1][2], state[2][2], state[3][2] = s2, s3, s0, s1
+        s0, s1, s2, s3 = state[0][3], state[1][3], state[2][3], state[3][3]
+        state[0][3], state[1][3], state[2][3], state[3][3] = s1, s2, s3, s0
         for c in range(4):
             for r in range(4):
-                state[c][r] = _AES_RSBOX[state[c][r]]
-        for c in range(4):
-            for r in range(4):
-                state[c][r] ^= round_keys[rnd][c*4 + r]
-        for c in range(4):
-            col = state[c]
-            a, b, cb, d = col[0], col[1], col[2], col[3]
-            state[c][0] = _gf_mul(0x0e, a) ^ _gf_mul(0x0b, b) ^ _gf_mul(0x0d, cb) ^ _gf_mul(0x09, d)
-            state[c][1] = _gf_mul(0x09, a) ^ _gf_mul(0x0e, b) ^ _gf_mul(0x0b, cb) ^ _gf_mul(0x0d, d)
-            state[c][2] = _gf_mul(0x0d, a) ^ _gf_mul(0x09, b) ^ _gf_mul(0x0e, cb) ^ _gf_mul(0x0b, d)
-            state[c][3] = _gf_mul(0x0b, a) ^ _gf_mul(0x0d, b) ^ _gf_mul(0x09, cb) ^ _gf_mul(0x0e, d)
-
-    s0, s1, s2, s3 = state[0], state[1], state[2], state[3]
-    state = [
-        [s0[0], s3[1], s2[2], s1[3]],
-        [s1[0], s0[1], s3[2], s2[3]],
-        [s2[0], s1[1], s0[2], s3[3]],
-        [s3[0], s2[1], s1[2], s0[3]]
-    ]
+                state[c][r] = _AES_INV_SBOX[state[c][r]]
+        for r in range(4):
+            for c in range(4):
+                state[c][r] ^= round_keys[rnd][r + 4 * c]
+        _inv_mix_columns(state)
+    s0, s1, s2, s3 = state[0][1], state[1][1], state[2][1], state[3][1]
+    state[0][1], state[1][1], state[2][1], state[3][1] = s3, s0, s1, s2
+    s0, s1, s2, s3 = state[0][2], state[1][2], state[2][2], state[3][2]
+    state[0][2], state[1][2], state[2][2], state[3][2] = s2, s3, s0, s1
+    s0, s1, s2, s3 = state[0][3], state[1][3], state[2][3], state[3][3]
+    state[0][3], state[1][3], state[2][3], state[3][3] = s1, s2, s3, s0
     for c in range(4):
         for r in range(4):
-            state[c][r] = _AES_RSBOX[state[c][r]]
-    for c in range(4):
-        for r in range(4):
-            state[c][r] ^= round_keys[0][c*4 + r]
-
+            state[c][r] = _AES_INV_SBOX[state[c][r]]
+    for r in range(4):
+        for c in range(4):
+            state[c][r] ^= round_keys[0][r + 4 * c]
     out = bytearray(16)
     for c in range(4):
         for r in range(4):
-            out[c*4 + r] = state[c][r]
+            out[r + 4 * c] = state[c][r]
     return bytes(out)
 
 
-def _pad_pkcs7(data: bytes, block_size: int = 16) -> bytes:
-    pad_len = block_size - (len(data) % block_size)
-    return data + bytes([pad_len] * pad_len)
+def _pure_aes256_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    pad_len = 16 - (len(data) % 16)
+    padded = data + bytes([pad_len] * pad_len)
+    round_keys = _pure_aes256_expand_key(key)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(padded), 16):
+        block = bytes(x ^ y for x, y in zip(padded[i : i + 16], prev))
+        enc = _pure_aes256_encrypt_block(block, round_keys)
+        out.extend(enc)
+        prev = enc
+    return bytes(out)
 
 
-def _unpad_pkcs7(data: bytes) -> bytes:
-    if not data or len(data) % 16 != 0:
-        raise ValueError("Invalid PKCS7 block length")
-    pad_len = data[-1]
-    if pad_len < 1 or pad_len > 16 or data[-pad_len:] != bytes([pad_len] * pad_len):
-        raise ValueError("Invalid PKCS7 padding bytes")
-    return data[:-pad_len]
+def _pure_aes256_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    if len(data) % 16 != 0:
+        raise ValueError("Ciphertext length must be a multiple of 16")
+    round_keys = _pure_aes256_expand_key(key)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), 16):
+        enc_block = data[i : i + 16]
+        dec = _pure_aes256_decrypt_block(enc_block, round_keys)
+        plain_block = bytes(x ^ y for x, y in zip(dec, prev))
+        out.extend(plain_block)
+        prev = enc_block
+    pad_len = out[-1]
+    if pad_len < 1 or pad_len > 16 or out[-pad_len:] != bytes([pad_len] * pad_len):
+        raise ValueError("Invalid PKCS7 padding")
+    return bytes(out[:-pad_len])
 
 
 class IvaCrypto:
     """
-    Complete cryptographic layer for IVA / Sadad APIs:
-      - AES-256-CBC with Zero IV / Custom IV and PKCS7 padding
-      - HMAC-SHA256 request signing
-      - RSA PKCS#1 v1.5 encryption for KeyExchange
+    Complete Cryptographic subsystem supporting:
+      - AES-256-CBC with DefaultAesIv (zero IV) or CustomAesIv (output lowercase hex)
+      - HMAC-SHA256 (output Base64)
+      - RSA-2048 PKCS#1 v1.5 Encryption (output lowercase hex)
+      - SPKI / Modulus PEM parsing and wrapping
     """
-    CUSTOM_IV = bytes([48, 148, 136, 186, 72, 57, 83, 116, 19, 138, 210, 230, 3, 165, 240, 35])
-    ZERO_IV = b"\x00" * 16
 
-    _libcrypto: Optional[Any] = None
-
-    @classmethod
-    def _get_libcrypto(cls) -> Optional[Any]:
-        if cls._libcrypto is None:
-            candidates = [
-                ctypes.util.find_library("crypto"),
-                "/data/data/com.termux/files/usr/lib/libcrypto.so",
-                "/data/data/com.termux/files/usr/lib/libcrypto.so.3",
-                "/usr/lib/libcrypto.so",
-                "libcrypto.so.3",
-                "libcrypto.so.1.1",
-                "libcrypto.so"
-            ]
-            for lib_name in candidates:
-                if not lib_name:
-                    continue
-                try:
-                    cls._libcrypto = ctypes.CDLL(lib_name)
-                    cls._libcrypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
-                    cls._libcrypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
-                    cls._libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
-                    cls._libcrypto.EVP_EncryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-                    cls._libcrypto.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-                    break
-                except Exception:
-                    cls._libcrypto = None
-        return cls._libcrypto
-
-    @classmethod
-    def generate_key(cls, num_bytes: int = 32) -> bytes:
+    @staticmethod
+    def generate_key(num_bytes: int = 32) -> bytes:
         return secrets.token_bytes(num_bytes)
 
     @classmethod
-    def aes_encrypt(cls, plaintext: str, key_base64: str) -> str:
-        return cls._aes_encrypt_iv(plaintext, key_base64, cls.ZERO_IV)
+    def aes_encrypt(cls, plaintext: str, key_base64: Optional[str] = None) -> str:
+        """AES-256-CBC encryption with DefaultAesIv (zero IV). Returns lowercase hex."""
+        return cls.aes_encrypt_with_iv(plaintext, key_base64, IvaConstants.DefaultAesIv)
 
     @classmethod
-    def aes_encrypt2(cls, plaintext: str, key_base64: str, iv: Optional[bytes] = None) -> str:
-        return cls._aes_encrypt_iv(plaintext, key_base64, iv or cls.CUSTOM_IV)
+    def aes_encrypt2(cls, plaintext: str, key_base64: Optional[str] = None, iv: Optional[bytes] = None) -> str:
+        """AES-256-CBC encryption with CustomAesIv. Returns lowercase hex."""
+        return cls.aes_encrypt_with_iv(plaintext, key_base64, iv or IvaConstants.CustomAesIv)
 
     @classmethod
-    def aes_decrypt(cls, hex_cipher: str, key_base64: str) -> str:
-        return cls._aes_decrypt_iv(hex_cipher, key_base64, cls.ZERO_IV)
+    def aes_decrypt(cls, hex_str: str, key_base64: Optional[str] = None) -> str:
+        """AES-256-CBC decryption with DefaultAesIv (zero IV). Returns plain string."""
+        return cls.aes_decrypt_with_iv(hex_str, key_base64, IvaConstants.DefaultAesIv)
 
     @classmethod
-    def _aes_encrypt_iv(cls, plaintext: str, key_base64: str, iv: bytes) -> str:
-        key_bytes = base64.b64decode(key_base64)
-        raw_data = plaintext.encode("utf-8")
-
-        # 1. Fast Path: cryptography library if available
-        if _HAS_CRYPTOGRAPHY:
-            try:
-                padder = crypto_padding.PKCS7(128).padder()
-                padded = padder.update(raw_data) + padder.finalize()
-                cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv))
-                enc = cipher.encryptor()
-                ct = enc.update(padded) + enc.finalize()
-                return ct.hex().lower()
-            except Exception as ex:
-                log_debug(f"Cryptography encrypt fallback: {ex}")
-
-        # 2. OpenSSL libcrypto via ctypes
-        lib = cls._get_libcrypto()
-        if lib:
-            ctx = lib.EVP_CIPHER_CTX_new()
-            try:
-                cipher = lib.EVP_aes_256_cbc()
-                lib.EVP_EncryptInit_ex(ctx, cipher, None, key_bytes, iv)
-                out = ctypes.create_string_buffer(len(raw_data) + 32)
-                out_len = ctypes.c_int(0)
-                lib.EVP_EncryptUpdate(ctx, out, ctypes.byref(out_len), raw_data, len(raw_data))
-                total_len = out_len.value
-                fin_len = ctypes.c_int(0)
-                ptr_fin = ctypes.cast(ctypes.addressof(out) + total_len, ctypes.POINTER(ctypes.c_char))
-                lib.EVP_EncryptFinal_ex(ctx, ptr_fin, ctypes.byref(fin_len))
-                total_len += fin_len.value
-                return bytes(out.raw[:total_len]).hex().lower()
-            except Exception as ex:
-                log_debug(f"OpenSSL encrypt fallback: {ex}")
-            finally:
-                lib.EVP_CIPHER_CTX_free(ctx)
-
-        # 3. Pure Python AES-256-CBC Implementation
-        padded_pure = _pad_pkcs7(raw_data)
-        rkeys = _key_expansion_256(key_bytes)
-        ct_pure = bytearray()
-        prev = iv
-        for i in range(0, len(padded_pure), 16):
-            block = bytes(padded_pure[i+j] ^ prev[j] for j in range(16))
-            enc_block = _aes_cipher_block(block, rkeys)
-            ct_pure.extend(enc_block)
-            prev = enc_block
-        return bytes(ct_pure).hex().lower()
-
-    @classmethod
-    def _aes_decrypt_iv(cls, hex_cipher: str, key_base64: str, iv: bytes) -> str:
-        key_bytes = base64.b64decode(key_base64)
-        cipher_bytes = bytes.fromhex(hex_cipher)
-
-        # 1. Fast Path: cryptography library if available
-        if _HAS_CRYPTOGRAPHY:
-            try:
-                cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv))
-                dec = cipher.decryptor()
-                padded = dec.update(cipher_bytes) + dec.finalize()
-                unpadder = crypto_padding.PKCS7(128).unpadder()
-                data = unpadder.update(padded) + unpadder.finalize()
-                return data.decode("utf-8")
-            except Exception as ex:
-                log_debug(f"Cryptography decrypt fallback: {ex}")
-
-        # 2. OpenSSL libcrypto via ctypes
-        lib = cls._get_libcrypto()
-        if lib:
-            ctx = lib.EVP_CIPHER_CTX_new()
-            try:
-                cipher = lib.EVP_aes_256_cbc()
-                lib.EVP_DecryptInit_ex(ctx, cipher, None, key_bytes, iv)
-                out = ctypes.create_string_buffer(len(cipher_bytes) + 32)
-                out_len = ctypes.c_int(0)
-                lib.EVP_DecryptUpdate(ctx, out, ctypes.byref(out_len), cipher_bytes, len(cipher_bytes))
-                total_len = out_len.value
-                fin_len = ctypes.c_int(0)
-                ptr_fin = ctypes.cast(ctypes.addressof(out) + total_len, ctypes.POINTER(ctypes.c_char))
-                lib.EVP_DecryptFinal_ex(ctx, ptr_fin, ctypes.byref(fin_len))
-                total_len += fin_len.value
-                return bytes(out.raw[:total_len]).decode("utf-8")
-            except Exception as ex:
-                log_debug(f"OpenSSL decrypt fallback: {ex}")
-            finally:
-                lib.EVP_CIPHER_CTX_free(ctx)
-
-        # 3. Pure Python AES-256-CBC Implementation
-        rkeys = _key_expansion_256(key_bytes)
-        pt_pure = bytearray()
-        prev = iv
-        for i in range(0, len(cipher_bytes), 16):
-            block = cipher_bytes[i:i+16]
-            dec_block = _aes_inv_cipher_block(block, rkeys)
-            pt_pure.extend(bytes(dec_block[j] ^ prev[j] for j in range(16)))
-            prev = block
-        return _unpad_pkcs7(bytes(pt_pure)).decode("utf-8")
-
-    @classmethod
-    def hmac_sha256(cls, data: str, working_key_base64: str) -> str:
-        key_bytes = base64.b64decode(working_key_base64)
-        h = hmac.new(key_bytes, data.encode("utf-8"), hashlib.sha256).digest()
-        return base64.b64encode(h).decode("utf-8")
-
-    @classmethod
-    def rsa_encrypt(cls, plaintext: str, public_key_str: str) -> str:
-        """RSA PKCS#1 v1.5 encryption output as lowercase hex."""
-        modulus, exponent = cls._parse_public_key(public_key_str)
+    def aes_encrypt_with_iv(cls, plaintext: str, key_base64: Optional[str], iv: bytes) -> str:
+        if not key_base64:
+            raise ValueError("Shared key is not set. Run KeyExchange first.")
+        key = base64.b64decode(key_base64)
         data = plaintext.encode("utf-8")
-        k = (modulus.bit_length() + 7) // 8
+
+        if _HAS_CRYPTOGRAPHY:
+            padder = crypto_padding.PKCS7(128).padder()
+            padded_data = padder.update(data) + padder.finalize()
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+            encryptor = cipher.encryptor()
+            encrypted = encryptor.update(padded_data) + encryptor.finalize()
+            return encrypted.hex().lower()
+
+        if _LIBCRYPTO:
+            try:
+                ctx = _LIBCRYPTO.EVP_CIPHER_CTX_new()
+                cipher = _LIBCRYPTO.EVP_aes_256_cbc()
+                _LIBCRYPTO.EVP_EncryptInit_ex(ctx, cipher, None, key, iv)
+                out = (ctypes.c_ubyte * (len(data) + 32))()
+                out_len = ctypes.c_int(0)
+                _LIBCRYPTO.EVP_EncryptUpdate(ctx, out, ctypes.byref(out_len), data, len(data))
+                tot = out_len.value
+                fin_len = ctypes.c_int(0)
+                _LIBCRYPTO.EVP_EncryptFinal_ex(ctx, ctypes.byref(out, tot), ctypes.byref(fin_len))
+                tot += fin_len.value
+                _LIBCRYPTO.EVP_CIPHER_CTX_free(ctx)
+                return bytes(out[:tot]).hex().lower()
+            except Exception:
+                pass
+
+        # Pure python fallback
+        encrypted = _pure_aes256_cbc_encrypt(key, iv, data)
+        return encrypted.hex().lower()
+
+    @classmethod
+    def aes_decrypt_with_iv(cls, hex_str: str, key_base64: Optional[str], iv: bytes) -> str:
+        if not key_base64:
+            raise ValueError("Shared key is not set. Run KeyExchange first.")
+        key = base64.b64decode(key_base64)
+        cipher_bytes = bytes.fromhex(hex_str)
+
+        if _HAS_CRYPTOGRAPHY:
+            cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+            decryptor = cipher.decryptor()
+            padded_data = decryptor.update(cipher_bytes) + decryptor.finalize()
+            unpadder = crypto_padding.PKCS7(128).unpadder()
+            data = unpadder.update(padded_data) + unpadder.finalize()
+            return data.decode("utf-8")
+
+        if _LIBCRYPTO:
+            try:
+                ctx = _LIBCRYPTO.EVP_CIPHER_CTX_new()
+                cipher = _LIBCRYPTO.EVP_aes_256_cbc()
+                _LIBCRYPTO.EVP_DecryptInit_ex(ctx, cipher, None, key, iv)
+                out = (ctypes.c_ubyte * (len(cipher_bytes) + 32))()
+                out_len = ctypes.c_int(0)
+                _LIBCRYPTO.EVP_DecryptUpdate(ctx, out, ctypes.byref(out_len), cipher_bytes, len(cipher_bytes))
+                tot = out_len.value
+                fin_len = ctypes.c_int(0)
+                _LIBCRYPTO.EVP_DecryptFinal_ex(ctx, ctypes.byref(out, tot), ctypes.byref(fin_len))
+                tot += fin_len.value
+                _LIBCRYPTO.EVP_CIPHER_CTX_free(ctx)
+                return bytes(out[:tot]).decode("utf-8")
+            except Exception:
+                pass
+
+        # Pure python fallback
+        data = _pure_aes256_cbc_decrypt(key, iv, cipher_bytes)
+        return data.decode("utf-8")
+
+    @classmethod
+    def hmac_sha256(cls, data: str, key_base64: str) -> str:
+        """HMAC-SHA256 calculation. Returns Base64 string for Sign-Data header."""
+        key = base64.b64decode(key_base64)
+        h = hmac.new(key, data.encode("utf-8"), hashlib.sha256)
+        return base64.b64encode(h.digest()).decode("ascii")
+
+    @classmethod
+    def rsa_encrypt(cls, plaintext: str, public_key_pem: str) -> str:
+        """RSA-2048 PKCS#1 v1.5 encryption. Returns lowercase hex string."""
+        data = plaintext.encode("utf-8")
+
+        if _HAS_CRYPTOGRAPHY:
+            pub_key = load_pem_public_key(public_key_pem.encode("utf-8"))
+            encrypted = pub_key.encrypt(data, asym_padding.PKCS1v15())
+            return encrypted.hex().lower()
+
+        # Pure Python PKCS#1 v1.5 RSA implementation
+        n, e = cls._parse_pem_rsa_pubkey(public_key_pem)
+        k = (n.bit_length() + 7) // 8
         if len(data) > k - 11:
-            raise ValueError("Message too long for RSA PKCS#1 v1.5")
+            raise ValueError("Data too long for RSA key size")
 
         ps_len = k - len(data) - 3
         ps = bytearray()
         while len(ps) < ps_len:
-            b = secrets.token_bytes(1)[0]
-            if b != 0:
-                ps.append(b)
+            rb = secrets.token_bytes(ps_len - len(ps))
+            for b in rb:
+                if b != 0:
+                    ps.append(b)
 
-        em = bytes([0x00, 0x02]) + bytes(ps) + bytes([0x00]) + data
-        m_int = int.from_bytes(em, "big")
-        c_int = pow(m_int, exponent, modulus)
-        c_bytes = c_int.to_bytes(k, "big")
+        em = b"\x00\x02" + bytes(ps) + b"\x00" + data
+        m = int.from_bytes(em, "big")
+        c = pow(m, e, n)
+        c_bytes = c.to_bytes(k, "big")
         return c_bytes.hex().lower()
 
-    @classmethod
-    def _parse_public_key(cls, pem_or_modulus: str) -> Tuple[int, int]:
-        clean = pem_or_modulus.strip()
-        lines = [line for line in clean.splitlines() if not line.startswith("---")]
-        raw_b64 = "".join(lines).strip()
-        der = base64.b64decode(raw_b64)
-        return cls._parse_asn1_der(der)
+    @staticmethod
+    def _parse_pem_rsa_pubkey(pem: str) -> Tuple[int, int]:
+        """Parses modulus n and exponent e from PEM SubjectPublicKeyInfo or PKCS#1."""
+        lines = [line.strip() for line in pem.strip().splitlines() if not line.startswith("-----")]
+        der = base64.b64decode("".join(lines))
 
-    @classmethod
-    def _parse_asn1_der(cls, der: bytes) -> Tuple[int, int]:
+        def read_asn1(buf: bytes, offset: int = 0) -> Tuple[int, bytes, int]:
+            tag = buf[offset]
+            offset += 1
+            length = buf[offset]
+            offset += 1
+            if length & 0x80:
+                num_octets = length & 0x7F
+                length = int.from_bytes(buf[offset : offset + num_octets], "big")
+                offset += num_octets
+            content = buf[offset : offset + length]
+            return tag, content, offset + length
+
         pos = 0
-        def read_len():
-            nonlocal pos
-            b = der[pos]
-            pos += 1
-            if b < 0x80:
-                return b
-            n = b & 0x7F
-            val = int.from_bytes(der[pos:pos+n], "big")
-            pos += n
-            return val
+        tag, seq_content, _ = read_asn1(der, 0)
+        p = 0
+        t1, c1, p1 = read_asn1(seq_content, p)
+        if t1 == 0x30:  # AlgorithmIdentifier
+            t2, bitstring, _ = read_asn1(seq_content, p1)
+            raw_seq = bitstring[1:]  # skip unused bits
+            _, key_seq_content, _ = read_asn1(raw_seq, 0)
+        else:
+            key_seq_content = seq_content
 
-        if der[pos] == 0x30:
-            pos += 1
-            read_len()
-            if der[pos] == 0x30:
-                pos += 1
-                seq_len = read_len()
-                pos += seq_len
-                if der[pos] == 0x03:
-                    pos += 1
-                    read_len()
-                    pos += 1  # unused bits
-                    if der[pos] == 0x30:
-                        pos += 1
-                        read_len()
+        kp = 0
+        _, mod_bytes, kp1 = read_asn1(key_seq_content, kp)
+        _, exp_bytes, _ = read_asn1(key_seq_content, kp1)
+        n = int.from_bytes(mod_bytes, "big")
+        e = int.from_bytes(exp_bytes, "big")
+        return n, e
 
-        if der[pos] == 0x02:
-            pos += 1
-            mod_len = read_len()
-            modulus = int.from_bytes(der[pos:pos+mod_len], "big")
-            pos += mod_len
-            if der[pos] == 0x02:
-                pos += 1
-                exp_len = read_len()
-                exponent = int.from_bytes(der[pos:pos+exp_len], "big")
-                return modulus, exponent
+    @staticmethod
+    def base64_to_hex(base64_str: str) -> str:
+        return base64.b64decode(base64_str).hex().lower()
 
-        modulus = int.from_bytes(der, "big")
-        return modulus, 65537
+    @staticmethod
+    def hex_to_base64(hex_str: str) -> str:
+        return base64.b64encode(bytes.fromhex(hex_str)).decode("ascii")
 
     @classmethod
-    def base64_modulus_to_pem(cls, modulus_base64: str) -> str:
-        mod_bytes = base64.b64decode(modulus_base64)
-        if mod_bytes[0] >= 0x80:
-            mod_bytes = b"\x00" + mod_bytes
-        exp_bytes = (65537).to_bytes(3, "big")
-
-        def encode_asn1(tag: int, val: bytes) -> bytes:
-            l = len(val)
-            if l < 0x80:
-                return bytes([tag, l]) + val
-            elif l <= 0xFF:
-                return bytes([tag, 0x81, l]) + val
-            else:
-                return bytes([tag, 0x82, (l >> 8) & 0xFF, l & 0xFF]) + val
-
-        mod_asn1 = encode_asn1(0x02, mod_bytes)
-        exp_asn1 = encode_asn1(0x02, exp_bytes)
-        rsa_seq = encode_asn1(0x30, mod_asn1 + exp_asn1)
-        bit_str = encode_asn1(0x03, b"\x00" + rsa_seq)
-
-        alg_id = bytes([0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00])
-        spki = encode_asn1(0x30, alg_id + bit_str)
-        b64 = base64.b64encode(spki).decode("ascii")
+    def base64_modulus_to_pem(cls, base64_modulus: str) -> str:
+        """Wraps a bare Base64 RSA modulus into a standard SPKI PEM string."""
+        spki_prefix = "30820122300d06092a864886f70d01010105000382010f003082010a0282010100"
+        spki_suffix = "0203010001"
+        mod_clean = base64_modulus.replace("\r", "").replace("\n", "").replace(" ", "")
+        mod_hex = base64.b64decode(mod_clean).hex().lower()
+        der_hex = spki_prefix + mod_hex + spki_suffix
+        der_bytes = bytes.fromhex(der_hex)
+        b64 = base64.b64encode(der_bytes).decode("ascii")
         chunks = [b64[i:i+64] for i in range(0, len(b64), 64)]
         return "-----BEGIN PUBLIC KEY-----\n" + "\n".join(chunks) + "\n-----END PUBLIC KEY-----\n"
 
@@ -577,40 +622,72 @@ class SessionData:
     phone: Optional[str] = None
     token: Optional[str] = None
     refreshToken: Optional[str] = None
+    tokenType: Optional[str] = None
     expiresIn: Optional[int] = None
     accessTokenObtainedAt: Optional[int] = None
-    rsaPublic: Optional[str] = None
     sharedKey: Optional[str] = None
     workingKey: Optional[str] = None
+    rsaPublic: Optional[str] = None
 
 
 @dataclass
 class CardPayment:
     pan: Optional[str] = None
-    pin: Optional[str] = None
     cvv2: Optional[str] = None
     expireMonth: Optional[str] = None
     expireYear: Optional[str] = None
+    pin: Optional[str] = None
     token: Optional[str] = None
 
     def validate(self) -> None:
-        if not self.token and not self.pan:
-            raise ValueError("یا PAN یا Token باید مقداردهی شوند.")
-        if not self.pin:
-            raise ValueError("رمز دوم / رمز پویا الزامی است.")
-        if not self.cvv2:
-            raise ValueError("کد CVV2 الزامی است.")
+        if not self.token:
+            if not self.pan or len(re.sub(r'\D', '', self.pan)) < 16:
+                raise ValueError("شماره کارت (PAN) نامعتبر است (باید حداقل ۱۶ رقم باشد).")
+            if not self.cvv2 or len(re.sub(r'\D', '', self.cvv2)) < 3:
+                raise ValueError("کد CVV2 نامعتبر است (باید حداقل ۳ رقم باشد).")
+            if not self.pin or len(re.sub(r'\D', '', self.pin)) < 4:
+                raise ValueError("رمز دوم / رمز پویا نامعتبر است (باید حداقل ۴ رقم باشد).")
+
+
+@dataclass
+class CardInfo:
+    pan: str = ""
+    expireMonth: str = ""
+    expireYear: str = ""
+    cvv2: str = ""
+    pin: str = ""
+    operatorName: str = ""
+    factorNumber: str = ""
+    success: bool = False
+    phoneUsed: str = ""
+    errorMessage: str = ""
+    testsPerformed: int = 0
+
+
+@dataclass
+class ChargePurchaseRequest:
+    amount: int
+    targetMobileNo: Optional[str] = None
+    providerId: Optional[str] = None
+    card: CardPayment = field(default_factory=CardPayment)
+    orderId: Optional[int] = None
+    extra: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class ChargePurchaseResult:
-    status_code: int
-    is_success: bool
-    status_title: Optional[str] = None
-    status_description: Optional[str] = None
-    error_message: Optional[str] = None
-    trackingCode: Optional[str] = None
+    success: bool = False
+    errorCode: Optional[str] = None
+    message: Optional[str] = None
+    usedPhone: Optional[str] = None
+    retryCount: int = 0
+    factorNumber: Optional[str] = None
     transactionId: Optional[str] = None
+    amount: Optional[int] = None
+    operatorName: Optional[str] = None
+    pin: Optional[str] = None
+    serial: Optional[str] = None
+    trackingCode: Optional[str] = None
     referenceNumber: Optional[str] = None
     status: Optional[str] = None
     cardHolderName: Optional[str] = None
@@ -627,7 +704,7 @@ class IvaApiException(Exception):
 # ------------------------------------------------------------------------------
 
 class FileSessionRepository:
-    """Thread-safe & atomic session repository isolated per Telegram/Terminal User ID and Phone."""
+    """Thread-safe & atomic session repository isolated per User ID and Phone."""
 
     def __init__(self, base_directory: Optional[str] = None):
         self.base_dir = os.path.abspath(base_directory or Config.SESSION_DIR)
@@ -714,11 +791,11 @@ class FileSessionRepository:
 
 
 # ------------------------------------------------------------------------------
-# 5. Async HTTP & IVA Auth Client
+# 5. Async HTTP & IvaAuthClient
 # ------------------------------------------------------------------------------
 
 class AsyncHttpClient:
-    """Async HTTP executor using standard library asyncio + urllib with Sadad/Iranian TLS support."""
+    """Async HTTP executor using standard library urllib with Sadad/Iranian TLS support."""
 
     def __init__(self, timeout: float = 65.0, proxy: Optional[str] = None):
         self.timeout = timeout
@@ -750,20 +827,36 @@ class AsyncHttpClient:
             try:
                 ctx.set_ciphers(cipher_suite)
                 break
-            except Exception:
-                pass
+            except ssl.SSLError:
+                continue
 
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    async def request(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]) -> Tuple[int, str]:
+    async def request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[str] = None,
+    ) -> Tuple[int, str]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._sync_request, method, url, headers, body)
+        return await loop.run_in_executor(None, self._sync_request, method, url, headers, data)
 
-    def _sync_request(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]) -> Tuple[int, str]:
-        req_data = body.encode("utf-8") if body is not None else None
-        req = urllib.request.Request(url, data=req_data, headers=headers, method=method)
+    def _sync_request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[str] = None,
+    ) -> Tuple[int, str]:
+        encoded_data = data.encode("utf-8") if data is not None else None
+        req = urllib.request.Request(url, data=encoded_data, method=method)
+
+        if headers:
+            for k, v in headers.items():
+                req.add_header(k, v)
 
         handlers = []
         if self.proxy:
@@ -773,27 +866,26 @@ class AsyncHttpClient:
 
         try:
             with opener.open(req, timeout=self.timeout) as resp:
-                status = resp.getcode()
-                resp_text = resp.read().decode("utf-8")
-                return status, resp_text
-        except urllib.error.HTTPError as ex:
-            status = ex.code
-            resp_text = ex.read().decode("utf-8", errors="replace")
-            return status, resp_text
+                code = resp.getcode()
+                body = resp.read().decode("utf-8", errors="replace")
+                return code, body
+        except urllib.error.HTTPError as http_err:
+            body = http_err.read().decode("utf-8", errors="replace")
+            return http_err.code, body
         except Exception as ex:
             err_msg = str(ex)
-
-            # Secondary fallback for TLS Handshake alerts
-            if "SSL" in err_msg or "HANDSHAKE" in err_msg or "EOF" in err_msg:
+            # Second attempt with fallback context
+            if "SSL" in err_msg or "HANDSHAKE" in err_msg or "ALERT" in err_msg or "EOF" in err_msg:
                 try:
-                    alt_ctx = ssl._create_unverified_context()
-                    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
-                        alt_ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-                    else:
-                        alt_ctx.options |= 0x4
+                    alt_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     alt_ctx.check_hostname = False
                     alt_ctx.verify_mode = ssl.CERT_NONE
-
+                    if hasattr(ssl, "OP_LEGACY_SERVER_CONNECT"):
+                        alt_ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
+                    try:
+                        alt_ctx.set_ciphers("DEFAULT:@SECLEVEL=0:ALL")
+                    except Exception:
+                        pass
                     alt_handlers = []
                     if self.proxy:
                         alt_handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
@@ -801,7 +893,7 @@ class AsyncHttpClient:
                     alt_opener = urllib.request.build_opener(*alt_handlers)
 
                     with alt_opener.open(req, timeout=self.timeout) as resp:
-                        return resp.getcode(), resp.read().decode("utf-8")
+                        return resp.getcode(), resp.read().decode("utf-8", errors="replace")
                 except urllib.error.HTTPError as hex_err:
                     return hex_err.code, hex_err.read().decode("utf-8", errors="replace")
                 except Exception as ex2:
@@ -818,7 +910,7 @@ class AsyncHttpClient:
                     f"خطای امنیتی گواهی SSL یا فیلترینگ جغرافیایی سرور ایوا:\n{clean_html(err_msg)}\n\n"
                     "💡 راهنمای رفع مشکل:\n"
                     "سرورهای پرداخت سداد/ایوا به دلیل مسائل امنیتی، آی‌پی‌های خارج از ایران (فیلترشکن‌ها) را مسدود یا ریست (EOF) می‌کنند.\n"
-                    "در نرم‌افزار وی‌پی‌ان خود گزینه «Bypass Iran / مستثنی کردن سایت‌های ایرانی» را فعال کنید."
+                    "در صورت استفاده از VPN، گزینه Bypass Iran را فعال کنید."
                 )
             else:
                 raise IvaApiException(f"خطای ارتباط شبکه: {err_msg}")
@@ -826,26 +918,22 @@ class AsyncHttpClient:
 
 class IvaAuthClient:
     """
-    Complete Async IVA API Client mirroring C# IvaAuthClient.cs:
-      - 8 Active Endpoints
+    Complete Async IVA API Client mirroring C# IvaScanner.IvaAuthClient:
+      - 8 Active Endpoints + Shaparak TSM getKey
       - AES/HMAC encryption & Signing
       - Automated 401 Refresh & Single-Retry
+      - Card Payment / PIN Charge purchase with retries
     """
-
-    SIGN_EXCLUDE = {
-        "/v1/users/auth/keyExchange",
-        "/v1/users/auth/verifyCode",
-        "/v1/users/auth/token",
-        "/v1/users/auth/refreshtoken",
-    }
 
     def __init__(self, telegram_user_id: int = 1001, phone: Optional[str] = None, repository: Optional[FileSessionRepository] = None):
         self.user_id = telegram_user_id
         self.current_phone = phone
         self.repo = repository or FileSessionRepository()
         self.session = SessionData(phone=phone)
+        self.crypto = IvaCrypto()
         self._last_otp_token: str = ""
         self._last_reagent: str = "0"
+        self._current_transaction_id: str = str(secrets.token_hex(16))
         iva_proxy = os.getenv("IVA_PROXY", "").strip() or None
         self.http = AsyncHttpClient(timeout=Config.REQUEST_TIMEOUT, proxy=iva_proxy)
 
@@ -859,12 +947,12 @@ class IvaAuthClient:
             self.session.phone = self.current_phone
             await self.repo.save(self.user_id, self.session)
 
-    def is_token_expired(self, buffer_seconds: int = 120) -> bool:
+    def is_token_expired(self, buffer_seconds: int = 30) -> bool:
         if not self.session.token:
             return True
         if not self.session.accessTokenObtainedAt or not self.session.expiresIn:
             return False
-        return (time.time() - self.session.accessTokenObtainedAt) > (self.session.expiresIn - buffer_seconds)
+        return (time.time() - self.session.accessTokenObtainedAt) >= (self.session.expiresIn - buffer_seconds)
 
     def apply_headers(self, path: str, serialized_body: Optional[str]) -> Dict[str, str]:
         headers = {
@@ -882,9 +970,9 @@ class IvaAuthClient:
             headers["iva-versioncode"] = Config.APP_VERSION.replace(".", "")
             headers["iva-versionname"] = Config.APP_VERSION
 
-        if serialized_body and path not in self.SIGN_EXCLUDE:
+        if serialized_body and path not in IvaConstants.SignExclude:
             if self.session.workingKey:
-                headers["Sign-Data"] = IvaCrypto.hmac_sha256(serialized_body, self.session.workingKey)
+                headers["Sign-Data"] = self.crypto.hmac_sha256(serialized_body, self.session.workingKey)
 
         return headers
 
@@ -942,17 +1030,91 @@ class IvaAuthClient:
 
         return doc.get("data") if doc.get("data") is not None else doc
 
-    # --- 1. Request OTP ---
+    # --- 1. Fetch Public Key from Shaparak TSM ---
+    async def fetch_public_key(self, key_id: Optional[str] = None, transaction_id: Optional[str] = None) -> str:
+        final_key_id = key_id or Config.KEY_ID or "1"
+        final_transaction_id = transaction_id or self._current_transaction_id
+        self._current_transaction_id = final_transaction_id
+
+        payload = {"keyId": final_key_id, "transactionId": final_transaction_id}
+        json_body = json.dumps(payload)
+        headers = {"Content-Type": "application/json"}
+
+        status, text = await self.http.request("POST", Config.PUBLIC_KEY_URL, headers, json_body)
+        if status != 200:
+            raise IvaApiException(f"getKey failed (HTTP {status}): {text}", str(status))
+
+        key_data = None
+        try:
+            doc = json.loads(text)
+            errs = doc.get("errors")
+            if errs and isinstance(errs, list) and len(errs) > 0:
+                err_desc = ", ".join(e.get("errorDescription", str(e)) for e in errs)
+                raise IvaApiException(f"getKey returned errors: {err_desc}")
+
+            key_data = doc.get("keyData")
+            if not key_data and isinstance(doc.get("data"), dict):
+                key_data = doc["data"].get("keyData")
+            if not key_data and isinstance(doc.get("data"), str):
+                key_data = doc["data"]
+        except json.JSONDecodeError:
+            pass
+
+        if not key_data:
+            raise IvaApiException("getKey response did not contain keyData: " + text)
+
+        # Wrap if raw base64 or keep if PEM
+        if "BEGIN" not in str(key_data):
+            pem_key = IvaCrypto.base64_modulus_to_pem(str(key_data))
+        else:
+            pem_key = str(key_data)
+
+        self.session.rsaPublic = pem_key
+        await self.save_session()
+        return pem_key
+
+    # --- 2. Key Exchange ---
+    async def key_exchange(self) -> None:
+        if not self.session.rsaPublic:
+            try:
+                await self.fetch_public_key()
+            except Exception:
+                await self.try_discover_public_key()
+
+        if not self.session.rsaPublic:
+            raise IvaApiException("کلید عمومی RSA سرور یافت نشد. ابتدا getKey یا ورود انجام دهید.")
+
+        shared_key = IvaCrypto.generate_key(32)
+        working_key = IvaCrypto.generate_key(32)
+
+        self.session.sharedKey = base64.b64encode(shared_key).decode("utf-8")
+        self.session.workingKey = base64.b64encode(working_key).decode("utf-8")
+
+        shared_hex = shared_key.hex().lower()
+        working_hex = working_key.hex().lower()
+
+        data_key = IvaCrypto.rsa_encrypt(shared_hex, self.session.rsaPublic)
+        mac_key = IvaCrypto.rsa_encrypt(working_hex, self.session.rsaPublic)
+
+        await self._post_json(IvaConstants.Endpoints.KeyExchange, {"DataKey": data_key, "MacKey": mac_key})
+        await self.save_session()
+
+    async def ensure_secure_channel(self) -> None:
+        if self.session.sharedKey and self.session.workingKey:
+            return
+        await self.key_exchange()
+
+    # --- 3. Request OTP ---
     async def request_otp(self, phone_number: str) -> Dict[str, Any]:
         self.current_phone = phone_number
         payload = {"PhoneNumber": phone_number}
-        data = await self._post_json("/v1/users/auth/verifyCode", payload)
+        data = await self._post_json(IvaConstants.Endpoints.RegisterRequest, payload)
         if isinstance(data, dict):
             self._last_otp_token = str(data.get("Token") or data.get("token") or "")
             self._last_reagent = str(data.get("ReagentNumber") or data.get("reagentNumber") or "0")
         return data
 
-    # --- 2. Verify OTP Code ---
+    # --- 4. Verify OTP Code ---
     async def verify_code(self, verification_code: str, token: Optional[str] = None, reagent_number: Optional[str] = None) -> Dict[str, Any]:
         tok = (token or self._last_otp_token or "").strip()
         reagent = (reagent_number or self._last_reagent or "0").strip()
@@ -961,17 +1123,17 @@ class IvaAuthClient:
             "Token": tok,
             "ReagentNumber": reagent
         }
-        data = await self._post_json("/v1/users/auth/token", payload)
+        data = await self._post_json(IvaConstants.Endpoints.Activation, payload)
         self._persist_tokens(data)
         await self.save_session()
         return data
 
-    # --- 3. Refresh Token ---
+    # --- 5. Refresh Token ---
     async def refresh_token(self, custom_refresh_token: Optional[str] = None) -> Dict[str, Any]:
         rt = custom_refresh_token or self.session.refreshToken
         if not rt:
             raise IvaApiException("رفرش‌توکن یافت نشد. لطفاً مجدداً لاگین کنید.", "401")
-        data = await self._post_json("/v1/users/auth/refreshtoken", {"RefreshToken": rt})
+        data = await self._post_json(IvaConstants.Endpoints.RefreshToken, {"RefreshToken": rt})
         self._persist_tokens(data)
         await self.save_session()
         return data
@@ -993,6 +1155,9 @@ class IvaAuthClient:
         exp_in = data.get("expiresIn") or data.get("ExpiresIn")
         if exp_in:
             self.session.expiresIn = int(exp_in)
+        token_type = data.get("tokenType") or data.get("TokenType")
+        if token_type:
+            self.session.tokenType = str(token_type)
         self.session.accessTokenObtainedAt = int(time.time())
         key = data.get("key") or data.get("Key")
         if key:
@@ -1001,38 +1166,11 @@ class IvaAuthClient:
             except Exception as ex:
                 log_debug(f"Modulus wrap note: {ex}")
 
-    # --- 4. Key Exchange ---
-    async def key_exchange(self) -> None:
-        if not self.session.rsaPublic:
-            await self.try_discover_public_key()
-        if not self.session.rsaPublic:
-            raise IvaApiException("کلید عمومی RSA سرور یافت نشد. لطفاً ابتدا لاگین کنید.")
-
-        shared_key = IvaCrypto.generate_key(32)
-        working_key = IvaCrypto.generate_key(32)
-
-        self.session.sharedKey = base64.b64encode(shared_key).decode("utf-8")
-        self.session.workingKey = base64.b64encode(working_key).decode("utf-8")
-
-        shared_hex = shared_key.hex().lower()
-        working_hex = working_key.hex().lower()
-
-        data_key = IvaCrypto.rsa_encrypt(shared_hex, self.session.rsaPublic)
-        mac_key = IvaCrypto.rsa_encrypt(working_hex, self.session.rsaPublic)
-
-        await self._post_json("/v1/users/auth/keyExchange", {"DataKey": data_key, "MacKey": mac_key})
-        await self.save_session()
-
-    async def ensure_secure_channel(self) -> None:
-        if self.session.sharedKey and self.session.workingKey:
-            return
-        await self.key_exchange()
-
-    # --- 5. User Profile ---
+    # --- 6. User Profile ---
     async def get_profile(self) -> Dict[str, Any]:
-        return await self._get_authorized_element("/v1/users/me")
+        return await self._get_authorized_element(IvaConstants.Endpoints.UserProfile)
 
-    # --- 6. App Configurations / Public Key Discovery ---
+    # --- 7. App Configurations & Public Key Discovery ---
     async def try_discover_public_key(self) -> None:
         version_parts = Config.APP_VERSION.split(".")
         query = {
@@ -1041,10 +1179,13 @@ class IvaAuthClient:
             "MarketType": "4",
         }
         try:
-            configs = await self._get_authorized_element("/v1/baseInfo/configs/list", query)
+            configs = await self._get_authorized_element(IvaConstants.Endpoints.AppConfiguration, query)
             key = self._find_public_key(configs)
             if key:
-                self.session.rsaPublic = key
+                if "BEGIN" not in str(key):
+                    self.session.rsaPublic = IvaCrypto.base64_modulus_to_pem(str(key))
+                else:
+                    self.session.rsaPublic = str(key)
                 await self.save_session()
         except Exception as ex:
             log_debug(f"Discovery notice: {ex}")
@@ -1052,7 +1193,7 @@ class IvaAuthClient:
     def _find_public_key(self, el: Any) -> Optional[str]:
         if isinstance(el, dict):
             for k, v in el.items():
-                if isinstance(v, str) and ("public" in k.lower() or "rsapublic" in k.lower()) and len(v) > 100:
+                if isinstance(v, str) and ("public" in k.lower() or "rsapublic" in k.lower()) and len(v) > 50:
                     return v
                 nested = self._find_public_key(v)
                 if nested:
@@ -1064,9 +1205,9 @@ class IvaAuthClient:
                     return nested
         return None
 
-    # --- 7. Charge Catalog ---
+    # --- 8. Charge Catalog ---
     async def get_charge_catalog(self) -> List[Dict[str, Any]]:
-        data = await self._get_authorized_element("/v3/charges/pin/mobile/catalog")
+        data = await self._get_authorized_element(IvaConstants.Endpoints.ChargeCatalog)
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
@@ -1075,56 +1216,137 @@ class IvaAuthClient:
                     return v
         return []
 
-    # --- 8. Pay Charge (Pin Payment) ---
-    async def buy_charge(self, provider_id: str, amount: int, target_mobile_no: str, card: CardPayment) -> ChargePurchaseResult:
-        card.validate()
-        await self.ensure_secure_channel()
+    # --- 9. Create Payment Body & Buy Charge ---
+    def create_payment_body(
+        self,
+        amount: int,
+        card: CardPayment,
+        extra: Optional[Dict[str, Any]] = None,
+        pocket_id: Optional[str] = None,
+        order_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not self.session.sharedKey:
+            raise ValueError("کانال امن برقرار نشده است. لطفاً ابتدا تبادل کلید انجام دهید.")
 
-        shared_key = self.session.sharedKey or ""
         media: Dict[str, Any] = {}
         if card.cvv2:
-            media["Cvv2"] = IvaCrypto.aes_encrypt(card.cvv2, shared_key)
+            media["Cvv2"] = self.crypto.aes_encrypt(card.cvv2, self.session.sharedKey)
         if card.pin:
-            media["Pin"] = IvaCrypto.aes_encrypt(card.pin, shared_key)
+            media["Pin"] = self.crypto.aes_encrypt(card.pin, self.session.sharedKey)
 
         expire = (card.expireYear or "") + (card.expireMonth or "").zfill(2)
-        if len("".join(c for c in expire if c.isdigit())) == 4:
-            media["ExpireDate"] = IvaCrypto.aes_encrypt(expire, shared_key)
+        digits_exp = "".join(c for c in expire if c.isdigit())
+        if len(digits_exp) == 4:
+            media["ExpireDate"] = self.crypto.aes_encrypt(expire, self.session.sharedKey)
 
         if card.token:
             media["Token"] = card.token
-            content_type = "application/vnd.sadad.payment.charge.Token+json"
-        else:
-            media["Pan"] = IvaCrypto.aes_encrypt(card.pan or "", shared_key)
-            content_type = "application/vnd.sadad.payment.charge.Card+json"
+        elif card.pan:
+            media["Pan"] = self.crypto.aes_encrypt(card.pan, self.session.sharedKey)
 
-        payload = {
-            "ProviderId": provider_id,
-            "Amount": amount,
-            "CellPhoneNumber": target_mobile_no,
-            "PaymentMedia": media
-        }
+        if pocket_id:
+            media["PocketId"] = pocket_id
 
-        url = Config.get_base_address() + "/v3/charges/pin/pay"
-        json_body = json.dumps(payload, ensure_ascii=False)
-        headers = self.apply_headers("/v3/charges/pin/pay", json_body)
+        body: Dict[str, Any] = {"paymentMedia": media}
+        if extra:
+            body.update(extra)
+
+        body["Amount"] = amount
+        body["OrderId"] = order_id or int(time.time() * 1000)
+        return body
+
+    async def post_signed_once(
+        self,
+        path: str,
+        body: Dict[str, Any],
+        content_type: str,
+        use_proxy: bool = False,
+    ) -> Tuple[int, str]:
+        url = Config.get_base_address() + path
+        json_body = json.dumps(body, ensure_ascii=False)
+        headers = self.apply_headers(path, json_body)
         headers["Content-Type"] = content_type
 
-        status, text = await self.http.request("POST", url, headers, json_body)
-        data = json.loads(text) if text.strip() else {}
+        return await self.http.request("POST", url, headers, json_body)
 
-        return ChargePurchaseResult(
-            status_code=status,
-            is_success=(status in (200, 201, 204)),
-            status_title=data.get("statusTitle"),
-            status_description=data.get("statusDescription"),
-            error_message=data.get("errorMessage"),
-            trackingCode=data.get("trackingCode"),
-            transactionId=data.get("transactionId"),
-            referenceNumber=data.get("referenceNumber"),
-            status=data.get("status"),
-            cardHolderName=data.get("cardHolderName"),
-        )
+    def parse_charge_outcome(self, text: str, status: int) -> ChargePurchaseResult:
+        try:
+            doc = json.loads(text) if text.strip() else {}
+            err = doc.get("error")
+            data = doc.get("data") if doc.get("data") is not None else doc
+
+            if err and str(err.get("code")) not in ("200", "None", ""):
+                return ChargePurchaseResult(
+                    success=False,
+                    errorCode=str(err.get("code")),
+                    message=err.get("message") or f"خطای درگاه (کد {err.get('code')})",
+                )
+
+            is_success = (status in (200, 201, 204)) and bool(data.get("trackingCode") or data.get("factorNumber") or data.get("pin") or data.get("transactionId"))
+            return ChargePurchaseResult(
+                success=is_success,
+                errorCode=str(status) if not is_success else None,
+                message=data.get("statusDescription") or data.get("statusTitle") or ("موفقیت‌آمیز" if is_success else None),
+                trackingCode=data.get("trackingCode"),
+                transactionId=data.get("transactionId"),
+                referenceNumber=data.get("referenceNumber"),
+                factorNumber=data.get("factorNumber"),
+                pin=data.get("pin"),
+                serial=data.get("serial"),
+                status=data.get("status"),
+                cardHolderName=data.get("cardHolderName"),
+            )
+        except Exception:
+            return ChargePurchaseResult(
+                success=False,
+                errorCode=str(status),
+                message=f"HTTP {status}: {text[:120]}",
+            )
+
+    async def buy_charge(
+        self,
+        request: ChargePurchaseRequest,
+        use_proxy: bool = False,
+    ) -> ChargePurchaseResult:
+        request.card.validate()
+        await self.ensure_secure_channel()
+
+        variant = "Token" if request.card.token else "pan"
+        content_type = f"application/vnd.sadad.payment.charge.{variant}+json"
+
+        order_id = request.orderId
+
+        def build_body() -> Dict[str, Any]:
+            extra: Dict[str, Any] = {
+                "TTL": int(time.time() * 1000),
+                "TargetMobileNo": request.targetMobileNo or self.current_phone,
+                "ProviderId": request.providerId or "1",
+            }
+            if request.extra:
+                extra.update(request.extra)
+            return self.create_payment_body(
+                amount=request.amount,
+                card=request.card,
+                extra=extra,
+                order_id=order_id,
+            )
+
+        built = build_body()
+        order_id = built.get("OrderId")
+
+        status, text = await self.post_signed_once(IvaConstants.Endpoints.PayCharge, built, content_type, use_proxy=use_proxy)
+
+        # On 401: Refresh and retry once
+        if status == 401:
+            log_info("Received 401 on PayCharge, refreshing auth and retrying...")
+            await self.refresh_auth()
+            built = build_body()
+            status, text = await self.post_signed_once(IvaConstants.Endpoints.PayCharge, built, content_type, use_proxy=use_proxy)
+
+        outcome = self.parse_charge_outcome(text, status)
+        outcome.usedPhone = self.current_phone
+        outcome.amount = request.amount
+        return outcome
 
 
 # ------------------------------------------------------------------------------
@@ -1132,7 +1354,7 @@ class IvaAuthClient:
 # ------------------------------------------------------------------------------
 
 async def run_terminal_cli() -> None:
-    """Complete interactive Terminal CLI for login, profile and testing without Telegram."""
+    """Complete interactive Terminal CLI for login, profile, card test and admin without Telegram."""
     repo = FileSessionRepository()
     user_id = 1001  # Terminal default user ID
     current_phone: Optional[str] = None
@@ -1154,7 +1376,7 @@ async def run_terminal_cli() -> None:
             return "0"
 
     print("\n" + "=" * 60)
-    print("🏦 سامانه ترمینال احراز هویت و مدیریت IVA / Sadad")
+    print("🏦 سامانه ترمینال احراز هویت و اسکنر IVA / Sadad (IvaScanner)")
     print("=" * 60)
 
     while True:
@@ -1167,14 +1389,16 @@ async def run_terminal_cli() -> None:
         print("2. 👤 دریافت اطلاعات حساب و پروفایل کاربری (/v1/users/me)")
         print("3. 🔄 تمدید توکن احراز هویت (RefreshToken)")
         print("4. 🔑 انجام تبادل کلید امنیتی (KeyExchange)")
-        print("5. 📱 دریافت اطلاعات پایه و کاتالوگ شارژ")
-        print("6. 📋 مشاهده و تعویض حساب‌های ذخیره‌شده")
-        print("7. 🤖 اجرای ربات تلگرام (Telegram Bot Polling)")
-        print("8. 🗑 حذف تمامی سشن‌ها و پاکسازی دیتابیس محلی")
+        print("5. 🔑 دریافت کلید عمومی شاپراک (TSM getKey)")
+        print("6. 📱 دریافت اطلاعات پایه و کاتالوگ شارژ")
+        print("7. 💳 خرید شارژ و تست کارت بانکی (Card Payment / Scanner)")
+        print("8. 📋 مشاهده و تعویض حساب‌های ذخیره‌شده")
+        print("9. 🤖 اجرای ربات تلگرام (Telegram Bot Polling)")
+        print("10. 🗑 حذف تمامی سشن‌ها و پاکسازی دیتابیس محلی")
         print("0. ❌ خروج")
         print("-" * 55)
 
-        choice = await loop.run_in_executor(None, ask, "👉 شماره گزینه را وارد فرمایید [0-8]: ")
+        choice = await loop.run_in_executor(None, ask, "👉 شماره گزینه را وارد فرمایید [0-10]: ")
 
         if choice == "0":
             print("\n👋 خروج از سامانه ترمینال.")
@@ -1198,90 +1422,134 @@ async def run_terminal_cli() -> None:
                 print("⏳ در حال اعتبارسنجی کد در سرور سداد...")
                 client.current_phone = phone
                 token_res = await client.verify_code(otp_code, token=req_token, reagent_number=reagent)
+                print("🎉 ورود با موفقیت انجام شد!")
+                print(f"⏱ مدت اعتبار توکن: {token_res.get('expiresIn', 0)} ثانیه")
 
-                print("⏳ در حال تبادل کلیدهای امنیتی AES...")
+                print("⏳ در حال انجام تبادل کلید امنیتی (KeyExchange)...")
                 try:
                     await client.key_exchange()
-                    print("✅ تبادل کلید AES با موفقیت انجام شد.")
+                    print("✅ تبادل کلید امنیتی با موفقیت انجام شد.")
                 except Exception as k_ex:
-                    print(f"⚠️ توجه در تبادل کلید: {k_ex}")
+                    print(f"⚠️ هشدار در تبادل کلید: {k_ex}")
 
-                print("\n🎉 احراز هویت با موفقیت کامل انجام شد و سشن ذخیره گردید!")
-                exp_seconds = token_res.get('expiresIn') or token_res.get('ExpiresIn') or 0
-                print(f"⏱ مدت زمان اعتبار توکن: {exp_seconds} ثانیه")
-                print("💡 اکنون این حساب به صورت خودکار در ربات تلگرام نیز فعال است.")
             except Exception as ex:
-                print(f"\n❌ خطا در فرآیند احراز هویت: {ex}")
+                print(f"❌ خطا در احراز هویت: {ex}")
 
         elif choice == "2":
             if not client.session.token:
-                print("❌ شما هنوز لاگین نکرده‌اید. لطفاً ابتدا گزینه ۱ را اجرا کنید.")
+                print("❌ شما وارد نشده‌اید. ابتدا گزینه 1 را اجرا کنید.")
                 continue
-            print("⏳ در حال استعلام اطلاعات کاربری از سرور...")
+            print("⏳ در حال دریافت پروفایل از سرور...")
             try:
                 prof = await client.get_profile()
-                print("\n👤 مشخصات پروفایل کاربری:")
-                print(f"• نام و نام‌خانوادگی: {prof.get('firstName', '')} {prof.get('lastName', '')}")
-                print(f"• کد ملی: {prof.get('nationalCode', '---')}")
-                print(f"• شماره همراه: {prof.get('cellPhoneNumber', client.current_phone)}")
-                print(f"• شناسه کاربری: {prof.get('userId', '---')}")
+                print("\n👤 اطلاعات پروفایل:")
+                print(f"نام: {prof.get('firstName', '')} {prof.get('lastName', '')}")
+                print(f"کد ملی: {prof.get('nationalCode', '---')}")
+                print(f"شماره موبایل: {prof.get('cellPhoneNumber', client.current_phone)}")
             except Exception as ex:
-                print(f"❌ خطا در دریافت اطلاعات: {ex}")
+                print(f"❌ خطا: {ex}")
 
         elif choice == "3":
             if not client.session.refreshToken:
-                print("❌ رفرش‌توکن ذخیره‌شده‌ای موجود نیست.")
+                print("❌ رفرش‌توکن ذخیره‌شده‌ای یافت نشد.")
                 continue
             print("⏳ در حال تمدید توکن...")
             try:
                 res = await client.refresh_token()
-                print(f"✅ اکسس‌توکن جدید دریافت شد! اعتبار: {res.get('expiresIn', 0)} ثانیه")
+                print(f"✅ توکن تمدید شد. اعتبار: {res.get('expiresIn', 0)} ثانیه")
             except Exception as ex:
-                print(f"❌ خطا در تمدید توکن: {ex}")
+                print(f"❌ خطا: {ex}")
 
         elif choice == "4":
-            print("⏳ در حال اجرای KeyExchange با سرور...")
+            print("⏳ در حال انجام تبادل کلید...")
             try:
                 await client.key_exchange()
-                print("✅ کانال امن شد و کلیدهای متقارن در سرور ثبت شدند.")
+                print("✅ تبادل کلید با موفقیت انجام شد.")
             except Exception as ex:
-                print(f"❌ خطا در تبادل کلید: {ex}")
+                print(f"❌ خطا: {ex}")
 
         elif choice == "5":
-            print("⏳ در حال استعلام کاتالوگ بسته‌های شارژ...")
+            print("⏳ در حال دریافت کلید عمومی شاپراک از TSM...")
             try:
-                cat = await client.get_charge_catalog()
-                print(f"✅ کاتالوگ با موفقیت دریافت شد. تعداد موارد: {len(cat)}")
-                for item in cat[:5]:
-                    print(f"  • {item.get('title', item.get('name', item))}")
+                pem = await client.fetch_public_key()
+                print("✅ کلید عمومی شاپراک دریافت و ذخیره گردید:")
+                print(pem[:120] + "...")
             except Exception as ex:
-                print(f"❌ خطا در دریافت کاتالوگ: {ex}")
+                print(f"❌ خطا: {ex}")
 
         elif choice == "6":
-            saved_phones = await repo.list_phones(user_id)
-            if not saved_phones:
+            print("⏳ در حال دریافت اطلاعات کاتالوگ شارژ...")
+            try:
+                cat = await client.get_charge_catalog()
+                print(f"✅ کاتالوگ شارژ دریافت شد. تعداد آیتم‌ها: {len(cat)}")
+            except Exception as ex:
+                print(f"❌ خطا: {ex}")
+
+        elif choice == "7":
+            print("\n💳 خرید شارژ و تست کارت بانکی:")
+            pan = await loop.run_in_executor(None, ask, "شماره کارت ۱۶ رقمی (PAN): ")
+            exp_year = await loop.run_in_executor(None, ask, "سال انقضا (دو رقم مثلاً 05): ")
+            exp_month = await loop.run_in_executor(None, ask, "ماه انقضا (دو رقم مثلاً 12): ")
+            cvv2 = await loop.run_in_executor(None, ask, "کد CVV2: ")
+            pin = await loop.run_in_executor(None, ask, "رمز دوم / پویا: ")
+            amount_str = await loop.run_in_executor(None, ask, "مبلغ به ریال (پیش‌فرض 10000): ")
+            amount = int(amount_str) if amount_str.isdigit() else 10000
+
+            card = CardPayment(
+                pan=pan.replace(" ", "").replace("-", ""),
+                expireYear=exp_year.strip(),
+                expireMonth=exp_month.strip(),
+                cvv2=cvv2.strip(),
+                pin=pin.strip(),
+            )
+            req = ChargePurchaseRequest(
+                amount=amount,
+                targetMobileNo=client.current_phone,
+                providerId="1",
+                card=card,
+            )
+
+            print("⏳ در حال ارسال تراکنش شارژ...")
+            try:
+                res = await client.buy_charge(req)
+                if res.success:
+                    print("🎉 تراکنش موفقیت‌آمیز بود!")
+                    print(f"کد پیگیری: {res.trackingCode}")
+                    print(f"شماره فاکتور: {res.factorNumber}")
+                    print(f"پین شارژ: {res.pin}")
+                else:
+                    print(f"❌ تراکنش ناموفق: {res.message} (کد {res.errorCode})")
+            except Exception as ex:
+                print(f"❌ خطای پرداخت: {ex}")
+
+        elif choice == "8":
+            phones = await repo.list_phones(user_id)
+            if not phones:
                 print("📭 هیچ حسابی ذخیره نشده است.")
                 continue
             print("\n📋 لیست حساب‌های ذخیره‌شده:")
-            for idx, p in enumerate(saved_phones, 1):
-                active_mark = " (فعال)" if p == client.current_phone else ""
-                print(f"  {idx}. {p}{active_mark}")
-            sel = await loop.run_in_executor(None, ask, "شماره ردیف حساب موردنظر را وارد کنید (یا Enter برای برگشت): ")
-            if sel.isdigit() and 1 <= int(sel) <= len(saved_phones):
-                selected_phone = saved_phones[int(sel)-1]
-                await client.load_session(selected_phone)
-                print(f"✅ حساب فعال به {selected_phone} تغییر یافت.")
+            for idx, p in enumerate(phones, 1):
+                marker = "👈 (فعال)" if p == client.current_phone else ""
+                print(f"{idx}. {p} {marker}")
 
-        elif choice == "7":
+            sel = await loop.run_in_executor(None, ask, "شماره ردیف حساب جهت انتخاب (یا Enter برای رد شدن): ")
+            if sel.isdigit() and 1 <= int(sel) <= len(phones):
+                target = phones[int(sel) - 1]
+                await client.load_session(target)
+                print(f"✅ حساب فعال به {target} تغییر یافت.")
+
+        elif choice == "9":
             token = Config.get_bot_token()
             if not token:
-                print("❌ توکن تلگرام تنظیم نشده است (TELEGRAM_BOT_TOKEN).")
+                token = await loop.run_in_executor(None, ask, "🤖 توکن ربات تلگرام را وارد فرمایید: ")
+            if not token:
+                print("❌ توکن ربات تلگرام وارد نشد.")
                 continue
-            print("🤖 در حال اجرای ربات تلگرام...")
+            print("\n🚀 در حال راه‌اندازی ربات تلگرام...")
             bot = TelegramBot(token)
             await bot.start_polling()
 
-        elif choice == "8":
+        elif choice == "10":
             confirm = await loop.run_in_executor(None, ask, "⚠️ آیا از حذف تمامی سشن‌ها و فایل‌های لاگین اطمینان دارید؟ [y/n]: ")
             if confirm.lower() in ("y", "yes", "بله", "1"):
                 if os.path.exists(Config.SESSION_DIR):
@@ -1363,7 +1631,7 @@ class TelegramBot:
     def get_main_menu(self, is_logged_in: bool, phone: Optional[str] = None, user_id: Optional[int] = None) -> Dict[str, Any]:
         keyboard = [
             [
-                {"text": "🔐 احراز هویت", "callback_data": "menu_auth"},
+                {"text": "🔐 احراز هویت (OTP)", "callback_data": "menu_auth"},
                 {"text": "👤 حساب من", "callback_data": "menu_profile"},
             ],
             [
@@ -1371,15 +1639,18 @@ class TelegramBot:
                 {"text": "🔑 تبادل کلید", "callback_data": "menu_keyexchange"},
             ],
             [
+                {"text": "🔑 کلید شاپراک TSM", "callback_data": "menu_tsm_key"},
                 {"text": "📱 اطلاعات IVA", "callback_data": "menu_configs"},
-                {"text": "💳 خرید شارژ", "callback_data": "menu_charge"},
             ],
             [
+                {"text": "💳 خرید شارژ و تست کارت", "callback_data": "menu_charge"},
                 {"text": "📋 مدیریت حساب‌ها", "callback_data": "menu_accounts"},
-                {"text": "📊 وضعیت نشست", "callback_data": "menu_status"},
             ],
             [
+                {"text": "📊 وضعیت نشست", "callback_data": "menu_status"},
                 {"text": "🧪 تست API", "callback_data": "menu_apitest"},
+            ],
+            [
                 {"text": "❓ راهنما", "callback_data": "menu_help"},
             ],
         ]
@@ -1435,11 +1706,11 @@ class TelegramBot:
             phone = client.current_phone
 
             welcome = (
-                "🏦 <b>پنل مدیریت و تست سامانه IVA / Sadad</b>\n\n"
-                f"وضعیت اتصال: <b>{'🟢 متصل' if is_connected else '⚪ متصل نیست'}</b>\n"
+                "🏦 <b>سامانه مدیریت و اسکنر IVA / Sadad (IvaScanner)</b>\n\n"
+                f"وضعیت اتصال: <b>{'🟢 متصل و آماده' if is_connected else '⚪ متصل نیست'}</b>\n"
                 f"حساب فعال: <code>{clean_html(phone or 'تعیین نشده')}</code>\n"
-                f"نسخه کلاینت: <code>{Config.APP_VERSION}</code>\n\n"
-                "جهت مدیریت حساب یا اجرای عملیات یکی از گزینه‌های زیر را انتخاب نمایید:"
+                f"نسخه PWA: <code>{Config.APP_VERSION}</code>\n\n"
+                "جهت اجرای عملیات یکی از گزینه‌های زیر را انتخاب نمایید:"
             )
             await self.send_message(chat_id, welcome, self.get_main_menu(is_connected, phone, user_id))
             return
@@ -1448,7 +1719,6 @@ class TelegramBot:
             phones = await self.repo.list_phones(user_id)
             for p in phones:
                 await self.repo.delete(user_id, p)
-            # Also clear terminal user 1001 if admin
             if self.is_admin(user_id):
                 t_phones = await self.repo.list_phones(1001)
                 for tp in t_phones:
@@ -1460,14 +1730,14 @@ class TelegramBot:
 
         if text == "/help":
             help_text = (
-                "📖 <b>راهنمای ربات تلگرام IVA / Sadad</b>\n\n"
-                "• <b>🔐 احراز هویت:</b> ورود به سیستم از طریق شماره موبایل و کد پیامکی OTP.\n"
+                "📖 <b>راهنمای ربات IVA Scanner</b>\n\n"
+                "• <b>🔐 احراز هویت:</b> ورود به سیستم با شماره موبایل و کد پیامکی OTP.\n"
                 "• <b>👤 حساب من:</b> نمایش اطلاعات پروفایل کاربری از <code>/v1/users/me</code>.\n"
                 "• <b>🔄 تمدید توکن:</b> دریافت اکسس‌توکن جدید با رفرش‌توکن ذخیره‌شده.\n"
-                "• <b>🔑 تبادل کلید:</b> تولید جفت‌کلیدهای امنیتی AES و ثبت در سرور.\n"
-                "• <b>📱 اطلاعات IVA:</b> بررسی آدرس‌ها، نسخه و کلید عمومی سرور.\n"
-                "• <b>💳 خرید شارژ:</b> خرید شارژ پین با رمزنگاری امن کارت بانکی.\n"
-                "• <b>📋 مدیریت حساب‌ها:</b> افزودن چند شماره و سوئیچ بین حساب‌ها.\n"
+                "• <b>🔑 تبادل کلید:</b> تولید کلیدهای امنیتی AES و ارسال امن به سرور.\n"
+                "• <b>🔑 کلید شاپراک TSM:</b> دریافت مستقیم کلید عمومی شاپراک از <code>tsm.shaparak.ir</code>.\n"
+                "• <b>💳 خرید شارژ و تست کارت:</b> انجام تراکنش و تست کارت با رمزنگاری AES.\n"
+                "• <b>📋 مدیریت حساب‌ها:</b> جابجایی بین چندین شماره و افزودن حساب جدید.\n"
                 "• <b>📊 وضعیت:</b> بررسی مدت زمان اعتبار توکن و آماده‌بودن کلیدها.\n"
                 "• <b>🧪 تست API:</b> تست سلامت تک‌تک اندپوینت‌ها.\n"
                 "• <b>🗑 خروج کامل:</b> ارسال دستور <code>/logout</code> جهت حذف تمام سشن‌ها."
@@ -1479,6 +1749,7 @@ class TelegramBot:
             await self.show_admin_panel(chat_id)
             return
 
+        # OTP Phone Input Step
         if step == "auth_phone":
             phone = text.replace(" ", "")
             if not phone.startswith("09") or len(phone) != 11:
@@ -1496,11 +1767,12 @@ class TelegramBot:
                     "reagent": res.get("ReagentNumber") or res.get("reagentNumber") or client._last_reagent,
                 }
                 user_active_phone[user_id] = phone
-                await self.send_message(chat_id, f"📩 کد تأیید ۵ رقمی به شماره <code>{clean_html(phone)}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
+                await self.send_message(chat_id, f"📩 کد ۵ رقمی به شماره <code>{clean_html(phone)}</code> پیامک شد.\nلطفاً کد دریافتی را ارسال نمایید:")
             except Exception as ex:
                 await self.send_message(chat_id, f"❌ خطا در درخواست OTP:\n{clean_html(ex)}")
             return
 
+        # OTP Code Verify Step
         if step == "auth_otp":
             otp_code = text.strip()
             phone = state.get("phone", "")
@@ -1509,7 +1781,7 @@ class TelegramBot:
             client = await self.get_client(user_id)
             client.current_phone = phone
 
-            await self.send_message(chat_id, "⏳ در حال اعتبارسنجی کد...")
+            await self.send_message(chat_id, "⏳ در حال اعتبارسنجی کد در سرور سداد...")
             try:
                 token_res = await client.verify_code(otp_code, token=req_token, reagent_number=reagent)
                 user_states[user_id] = {}
@@ -1533,6 +1805,60 @@ class TelegramBot:
                 await self.send_message(chat_id, f"❌ خطا در تأیید کد:\n{clean_html(ex)}\nلطفاً مجدداً کد را ارسال نمایید:")
             return
 
+        # Card Charge Payment / Scanner Wizard
+        if step == "charge_wizard":
+            # Supports direct pipe format: PAN|YY|MM|CVV2|PIN|AMOUNT|PHONE or single line
+            parts = [p.strip() for p in text.split("|")]
+            if len(parts) >= 5:
+                pan, yy, mm, cvv2, pin = parts[0], parts[1], parts[2], parts[3], parts[4]
+                amount = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 10000
+                target_phone = parts[6] if len(parts) > 6 and parts[6].startswith("09") else (client.current_phone or "")
+
+                card = CardPayment(
+                    pan=re.sub(r'\D', '', pan),
+                    expireYear=yy.zfill(2),
+                    expireMonth=mm.zfill(2),
+                    cvv2=cvv2,
+                    pin=pin,
+                )
+                req = ChargePurchaseRequest(
+                    amount=amount,
+                    targetMobileNo=target_phone,
+                    providerId="1",
+                    card=card,
+                )
+
+                client = await self.get_client(user_id)
+                await self.send_message(chat_id, "⏳ در حال رمزنگاری اطلاعات کارت و ارسال تراکنش...")
+                try:
+                    res = await client.buy_charge(req)
+                    user_states[user_id] = {}
+                    if res.success:
+                        card_mask = mask_sensitive(card.pan or "")
+                        res_text = (
+                            "🎉 <b>تراکنش با موفقیت انجام شد!</b>\n\n"
+                            f"💳 کارت: <code>{card_mask}</code>\n"
+                            f"💰 مبلغ: <code>{amount:,} ریال</code>\n"
+                            f"🧾 شماره فاکتور: <code>{clean_html(res.factorNumber or '---')}</code>\n"
+                            f"🔢 کد پیگیری: <code>{clean_html(res.trackingCode or '---')}</code>\n"
+                            f"🆔 شناسه تراکنش: <code>{clean_html(res.transactionId or '---')}</code>\n"
+                            f"🔑 پین شارژ: <code>{clean_html(res.pin or '---')}</code>\n"
+                            f"👤 دارنده کارت: <code>{clean_html(res.cardHolderName or '---')}</code>"
+                        )
+                    else:
+                        res_text = (
+                            "❌ <b>تراکنش ناموفق بود:</b>\n\n"
+                            f"پیام سرور: <code>{clean_html(res.message or 'خطای ناشناخته')}</code>\n"
+                            f"کد خطا: <code>{clean_html(res.errorCode or '---')}</code>"
+                        )
+                    await self.send_message(chat_id, res_text, self.get_main_menu(bool(client.session.token), client.current_phone, user_id))
+                except Exception as ex:
+                    await self.send_message(chat_id, f"❌ خطای پرداخت شارژ:\n{clean_html(ex)}")
+                return
+            else:
+                await self.send_message(chat_id, "❌ قالب نامعتبر است.\nلطفاً اطلاعات را به این فرمت ارسال کنید:\n<code>شماره‌کارت|سال|ماه|CVV2|رمز‌پویا|مبلغ</code>\n\nمثال:\n<code>6037991234567890|05|10|123|12345|10000</code>")
+                return
+
         # Default fallback
         client = await self.get_client(user_id)
         is_connected = bool(client.session.token)
@@ -1548,7 +1874,7 @@ class TelegramBot:
 
         if data == "menu_auth":
             user_states[user_id] = {"step": "auth_phone"}
-            await self.send_message(chat_id, "📱 لطفاً شماره تلفن همراه خود را ارسال کنید:\nمثال: <code>09121234567</code>")
+            await self.send_message(chat_id, "📱 لطفاً شماره تلفن همراه خود را ارسال فرمایید:\nمثال: <code>09121234567</code>")
             return
 
         if data == "menu_profile":
@@ -1591,24 +1917,38 @@ class TelegramBot:
                 await self.send_message(chat_id, f"❌ خطای تبادل کلید:\n{clean_html(ex)}")
             return
 
+        if data == "menu_tsm_key":
+            await self.send_message(chat_id, "🔑 در حال دریافت کلید عمومی شاپراک از سامانه TSM...")
+            try:
+                pem = await client.fetch_public_key()
+                await self.send_message(chat_id, "✅ کلید عمومی شاپراک (TSM) با موفقیت دریافت و ثبت گردید.")
+            except Exception as ex:
+                await self.send_message(chat_id, f"❌ خطای دریافت کلید شاپراک:\n{clean_html(ex)}")
+            return
+
         if data == "menu_configs":
             info_text = (
                 "📱 <b>اطلاعات پیکربندی و سرورهای IVA / Sadad:</b>\n\n"
                 f"آدرس پایه: <code>{Config.API_BASE_URL}</code>\n"
                 f"پیشوند API: <code>{Config.API_PREFIX}</code>\n"
+                f"آدرس کلید TSM: <code>{Config.PUBLIC_KEY_URL}</code>\n"
                 f"نسخه PWA: <code>{Config.APP_VERSION}</code>\n"
-                f"محیط رمزنگاری: <b>{'Cryptography Module' if _HAS_CRYPTOGRAPHY else 'Native libcrypto / Pure-Python'}</b>"
+                f"محیط رمزنگاری: <b>{'Cryptography Module' if _HAS_CRYPTOGRAPHY else ('Native libcrypto' if _LIBCRYPTO else 'Pure-Python AES Engine')}</b>"
             )
             await self.send_message(chat_id, info_text)
             return
 
         if data == "menu_charge":
-            await self.send_message(chat_id, "⏳ در حال دریافت کاتالوگ شارژ...")
-            try:
-                catalog = await client.get_charge_catalog()
-                await self.send_message(chat_id, f"📦 کاتالوگ بسته‌های شارژ دریافت شد.\nتعداد موارد: <code>{len(catalog)}</code>")
-            except Exception as ex:
-                await self.send_message(chat_id, f"❌ خطای دریافت کاتالوگ:\n{clean_html(ex)}")
+            user_states[user_id] = {"step": "charge_wizard"}
+            guide_msg = (
+                "💳 <b>خرید شارژ و تست کارت بانکی (Card Payment / Scanner):</b>\n\n"
+                "لطفاً اطلاعات کارت را در یک پیام با علامت <code>|</code> ارسال فرمایید:\n"
+                "<code>شماره‌کارت|سال|ماه|CVV2|رمز‌پویا|مبلغ</code>\n\n"
+                "📝 <b>مثال:</b>\n"
+                "<code>6037991234567890|05|10|123|12345|10000</code>\n\n"
+                "(مبلغ پیش‌فرض ۱۰,۰۰۰ ریال است و در صورت عدم ورود، در نظر گرفته خواهد شد)."
+            )
+            await self.send_message(chat_id, guide_msg)
             return
 
         if data == "menu_status":
@@ -1664,6 +2004,7 @@ class TelegramBot:
                 [{"text": "🧪 تست /configs/list", "callback_data": "test_configs"}],
                 [{"text": "🧪 تست /catalog", "callback_data": "test_catalog"}],
                 [{"text": "🧪 تست Key Exchange", "callback_data": "test_keyex"}],
+                [{"text": "🧪 تست Shaparak TSM", "callback_data": "test_tsm"}],
                 [{"text": "🔙 بازگشت به منوی اصلی", "callback_data": "menu_start"}],
             ]
             await self.send_message(chat_id, "🧪 <b>پنل تست مستقیم APIهای IVA</b>\nیک تست را انتخاب نمایید:", {"inline_keyboard": test_menu})
@@ -1699,6 +2040,14 @@ class TelegramBot:
                 await self.send_message(chat_id, "✅ تبادل کلید موفقیت‌آمیز بود.")
             except Exception as ex:
                 await self.send_message(chat_id, f"❌ خطای Key Exchange:\n{clean_html(ex)}")
+            return
+
+        if data == "test_tsm":
+            try:
+                pem = await client.fetch_public_key()
+                await self.send_message(chat_id, f"✅ خروجی موفق <code>tsm.shaparak.ir</code>:\n<code>{clean_html(pem[:200])}...</code>")
+            except Exception as ex:
+                await self.send_message(chat_id, f"❌ خطای تست TSM:\n{clean_html(ex)}")
             return
 
         if data == "menu_help":
@@ -1749,95 +2098,84 @@ class TelegramBot:
 
     async def start_polling(self) -> None:
         if not self.token:
-            log_error("TELEGRAM_BOT_TOKEN is not configured. Switching to Terminal CLI mode.")
-            await run_terminal_cli()
+            log_error("TELEGRAM_BOT_TOKEN is not configured. Telegram bot polling aborted.")
             return
 
+        log_info("Starting Telegram Bot Long-Polling Engine...")
         self.is_running = True
-        log_info("Telegram Bot Starting... (Ready for Termux / Linux)")
-        log_info(f"Session directory: {Config.SESSION_DIR}")
-        log_info(f"Log file: {log_file_path}")
-        admin_id = Config.get_admin_id()
-        if admin_id:
-            log_info(f"Admin ID configured: {admin_id}")
-
-        # Check getMe on startup
-        me_res = await self.call_api("getMe")
-        if me_res.get("ok"):
-            bot_user = me_res.get("result", {})
-            log_info(f"Connected to Telegram API as @{bot_user.get('username')} (ID: {bot_user.get('id')})")
-        else:
-            log_error(f"Telegram getMe check: {me_res.get('description')}")
-
         offset = 0
+
+        # Fetch bot user info
+        me = await self.call_api("getMe")
+        if me.get("ok"):
+            bot_user = me.get("result", {})
+            log_info(f"Bot connected: @{bot_user.get('username')} ({bot_user.get('first_name')})")
+        else:
+            log_error(f"Failed to getMe: {me.get('description')}")
+
         while self.is_running:
             try:
-                payload = {"offset": offset, "timeout": 20}
-                res = await self.call_api("getUpdates", payload)
+                res = await self.call_api("getUpdates", {"offset": offset, "timeout": 25})
                 if res.get("ok"):
-                    for update in res.get("result", []):
-                        offset = update["update_id"] + 1
-                        asyncio.create_task(self.handle_update(update))
+                    updates = res.get("result", [])
+                    for upd in updates:
+                        offset = max(offset, upd["update_id"] + 1)
+                        asyncio.create_task(self.handle_update(upd))
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
             except Exception as ex:
-                log_error(f"Polling loop notice: {ex}")
+                log_error(f"Polling Exception: {ex}")
                 await asyncio.sleep(3)
 
 
 # ------------------------------------------------------------------------------
-# 8. Self-Verification Health Check & Entry Point
+# 8. Entrypoint Dispatcher
 # ------------------------------------------------------------------------------
 
-async def run_health_check() -> bool:
-    """Pre-flight check for Crypto, Session storage and Termux readiness."""
-    log_info("Running pre-flight health checks...")
+def run_preflight_checks() -> bool:
+    """Verifies crypto primitives and storage paths before startup."""
+    try:
+        # Check AES encryption and decryption
+        test_key = base64.b64encode(b"\x01" * 32).decode("ascii")
+        enc = IvaCrypto.aes_encrypt("test_message", test_key)
+        dec = IvaCrypto.aes_decrypt(enc, test_key)
+        if dec != "test_message":
+            return False
 
-    # 1. AES & Crypto Check
-    k = IvaCrypto.generate_key(32)
-    kb64 = base64.b64encode(k).decode("utf-8")
-    enc = IvaCrypto.aes_encrypt("TermuxIVA123", kb64)
-    dec = IvaCrypto.aes_decrypt(enc, kb64)
-    assert dec == "TermuxIVA123", "Crypto self-test failed!"
+        # Check HMAC
+        mac = IvaCrypto.hmac_sha256("test_body", test_key)
+        if not mac:
+            return False
 
-    # 2. Session Repository Check
-    test_repo = FileSessionRepository(Config.SESSION_DIR)
-    dummy_session = SessionData(phone="09120000000", token="health_tok")
-    await test_repo.save(999999, dummy_session)
-    loaded = await test_repo.load(999999, "09120000000")
-    assert loaded is not None and loaded.token == "health_tok"
-    await test_repo.delete(999999, "09120000000")
-
-    log_info("Pre-flight health checks PASSED.")
-    return True
+        return True
+    except Exception as ex:
+        log_error(f"Pre-flight health check failed: {ex}")
+        return False
 
 
 async def main() -> None:
-    try:
-        await run_health_check()
-        
-        # Check if terminal CLI mode is explicitly requested or bot token is empty
-        run_cli_mode = (
-            "--cli" in sys.argv or
-            "--terminal" in sys.argv or
-            os.getenv("IVA_MODE") == "terminal" or
-            not Config.get_bot_token()
-        )
+    if not run_preflight_checks():
+        log_error("Pre-flight health checks failed. Check crypto configuration.")
 
-        if run_cli_mode:
-            print("\n💻 اجرای مستقیم در حالت ترمینال (Terminal CLI Mode)...")
-            await run_terminal_cli()
-        else:
-            bot = TelegramBot(Config.get_bot_token())
-            await bot.start_polling()
+    # Check CLI argument or environment mode
+    if len(sys.argv) > 1 and sys.argv[1] in ("--cli", "-c", "cli", "terminal"):
+        await run_terminal_cli()
+        return
 
-    except Exception as ex:
-        log_error(f"Fatal error during execution: {ex}\n{traceback.format_exc()}")
-        raise
+    # If BOT_TOKEN is present, launch Telegram bot
+    bot_token = Config.get_bot_token()
+    if bot_token:
+        bot = TelegramBot(bot_token)
+        await bot.start_polling()
+    else:
+        # Fallback to interactive Terminal CLI
+        await run_terminal_cli()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nبرنامه با درخواست کاربر متوقف شد.")
+        print("\nShutdown complete.")

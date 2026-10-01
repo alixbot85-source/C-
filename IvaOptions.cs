@@ -17,7 +17,7 @@ public sealed class SecurityOptions
 /// <summary>Client configuration.</summary>
 public sealed class IvaOptions
 {
-    public string ApiBaseUrl { get; set; } = "https://ivaapi.sadadpsp.ir";
+    public string ApiBaseUrl { get; set; } = "https://ivapwa.sadadpsp.ir";
 
     /// <summary>All API paths are served under this prefix.</summary>
     public string ApiPrefix { get; set; } = "/pwa/api";
